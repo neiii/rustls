@@ -127,6 +127,8 @@ enum_builder! {
         Padding => 0x0015,
         ExtendedMasterSecret => 0x0017,
         CompressCertificate => 0x001b,
+        // FAIM: record_size_limit (RFC 8449), which a template may offer.
+        RecordSizeLimit => 0x001c,
         SessionTicket => 0x0023,
         PreSharedKey => 0x0029,
         EarlyData => 0x002a,

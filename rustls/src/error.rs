@@ -80,6 +80,10 @@ pub enum Error {
     /// A catch-all error for unlikely errors.
     General(String),
 
+    /// FAIM: the server picked something from a hello template's offer that the fork
+    /// can't complete (`ClientConfig::hello_template`).
+    Shortfall(faim_template::Shortfall),
+
     /// We failed to figure out what time it currently is.
     FailedToGetCurrentTime,
 
@@ -259,6 +263,8 @@ pub enum PeerMisbehaved {
     IllegalHelloRetryRequestWithWrongSessionId,
     IllegalHelloRetryRequestWithInvalidEch,
     IllegalMiddleboxChangeCipherSpec,
+    /// FAIM: a `record_size_limit` below RFC 8449's minimum of 64.
+    IllegalRecordSizeLimit,
     IllegalTlsInnerPlaintext,
     IncorrectBinder,
     InvalidCertCompression,
@@ -1008,6 +1014,7 @@ impl fmt::Display for Error {
                 write!(f, "keys may not be consistent: {why:?}")
             }
             Self::General(err) => write!(f, "unexpected error: {err}"),
+            Self::Shortfall(shortfall) => write!(f, "{shortfall}"),
             Self::Other(err) => write!(f, "other error: {err}"),
         }
     }

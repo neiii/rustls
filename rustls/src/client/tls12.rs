@@ -924,6 +924,8 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
                 ));
             }
 
+            // FAIM: a template's scheme is one it offered, and one the fork can verify.
+            hs::template::check_signature_scheme(cx.common, &st.config, sig.scheme)?;
             st.config
                 .verifier
                 .verify_tls12_signature(&message, end_entity, sig)
@@ -949,6 +951,17 @@ impl State<ClientConnectionData> for ExpectServerDone<'_> {
             cx.common,
             &st.server_kx.kx_params,
         )?;
+        // FAIM: a template's curve is one it offered, and one the fork can compute.
+        if let (Some(hello_template), ServerKeyExchangeParams::Ecdh(ecdh)) =
+            (st.config.hello_template.as_deref(), &kx_params)
+        {
+            hs::template::check_curve(
+                cx.common,
+                hello_template,
+                &st.config,
+                ecdh.curve_params.named_group,
+            )?;
+        }
         let maybe_skxg = match &kx_params {
             ServerKeyExchangeParams::Ecdh(ecdh) => st
                 .config

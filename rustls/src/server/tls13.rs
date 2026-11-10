@@ -21,8 +21,9 @@ use crate::log::{debug, trace, warn};
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::KeyUpdateRequest;
 use crate::msgs::handshake::{
-    CERTIFICATE_MAX_SIZE_LIMIT, CertificateChain, CertificatePayloadTls13, HandshakeMessagePayload,
-    HandshakePayload, NewSessionTicketPayloadTls13,
+    CERTIFICATE_MAX_SIZE_LIMIT, CertificateChain, CertificatePayloadTls13, EchConfigPayload,
+    HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayloadTls13,
+    ServerEncryptedClientHello,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
@@ -741,6 +742,21 @@ mod client_hello {
             ep.extensions.early_data_ack = Some(());
         }
 
+        // FAIM: retry configs for a client that offered ECH, which this server never
+        // accepts (RFC 9849 §7.1). Configs that don't parse, or parse to an empty list
+        // the extension doesn't allow, are left out: ServerHello has gone out, and the
+        // client is answered the same way without them.
+        if let (Some(configs), Some(_)) = (&config.ech_retry_configs, &hello.encrypted_client_hello)
+        {
+            match Vec::<EchConfigPayload>::read(&mut Reader::init(configs)) {
+                Ok(retry_configs) if !retry_configs.is_empty() => {
+                    ep.extensions.encrypted_client_hello_ack =
+                        Some(ServerEncryptedClientHello { retry_configs });
+                }
+                _ => warn!("not sending ech_retry_configs that are empty or don't parse"),
+            }
+        }
+
         let ee = HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(ep.extensions));
 
         trace!("sending encrypted extensions {ee:?}");
@@ -1106,6 +1122,19 @@ impl State<ServerConnectionData> for ExpectCertificate {
             return Err(cx.common.send_fatal_alert(
                 AlertDescription::DecodeError,
                 InvalidMessage::InvalidCertRequest,
+            ));
+        }
+
+        // FAIM: the certificate entry extensions decoding no longer refuses. A server
+        // offers none, so it refuses them all here.
+        if certp
+            .unknown_extensions()
+            .next()
+            .is_some()
+        {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::DecodeError,
+                InvalidMessage::UnknownCertificateExtension,
             ));
         }
 

@@ -842,6 +842,8 @@ fn sample_server_hello_payload() -> ServerHelloPayload {
             transport_parameters_draft: None,
             client_certificate_type: Some(CertificateType::RawPublicKey),
             server_certificate_type: Some(CertificateType::RawPublicKey),
+            // FAIM: record_size_limit, which a template may offer.
+            record_size_limit: Some(16385),
             unknown_extensions: Default::default(),
         }),
     }
@@ -962,6 +964,8 @@ fn sample_certificate_payload_tls13() -> CertificatePayloadTls13<'static> {
                 status: Some(CertificateStatus {
                     ocsp_response: PayloadU24::from(Payload::new(vec![1, 2, 3])),
                 }),
+                // FAIM: the unknown extensions a client checks against its hello.
+                unknown_extensions: Default::default(),
             },
         }],
     }

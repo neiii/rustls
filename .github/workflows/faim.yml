@@ -1,0 +1,85 @@
+name: faim
+
+# rustls's own tests and BoGo on FAIM's fork (PATCHES.md). The fork's rustls crate
+# depends on faim-template, which lives in neiii/faim-http, a private repository, so the
+# job checks it out beside this one with FAIM_HTTP_TOKEN: a fine-grained token with
+# Contents: read on neiii/faim-http.
+on:
+  push:
+    branches: [faim]
+  pull_request:
+    branches: [faim]
+  workflow_dispatch:
+    inputs:
+      faim-http-ref:
+        description: "The faim-http branch, tag or commit to build faim-template from, in place of FAIM_HTTP_REF's"
+        required: false
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run it supersedes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  BOGO_SHIM_PROVIDER: aws-lc-rs
+
+jobs:
+  faim:
+    runs-on: ubuntu-latest
+    # BoGo builds its Go runner and the shim, then runs some 6,000 cases.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: rustls
+          persist-credentials: false
+      # FAIM_HTTP_REF names the faim-http commit whose faim-template this commit builds
+      # with: a commit, not a branch, so a run is reproducible, and one not yet on master
+      # when a change here needs an unmerged faim-template change.
+      - name: Read the faim-http ref
+        id: faim-http
+        env:
+          OVERRIDE: ${{ inputs.faim-http-ref }}
+        run: |
+          ref=${OVERRIDE:-$(tr -d '[:space:]' < rustls/FAIM_HTTP_REF)}
+          test -n "$ref"
+          echo "Building against faim-http $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      # The workspace's [patch.crates-io] takes faim-template from ../faim-http.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: neiii/faim-http
+          ref: ${{ steps.faim-http.outputs.ref }}
+          token: ${{ secrets.FAIM_HTTP_TOKEN }}
+          path: faim-http
+          persist-credentials: false
+      # faim-template builds on FAIM's nightly, the `rust` line of faim-http's mise.toml.
+      - name: Install FAIM's toolchain
+        run: |
+          toolchain=$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' faim-http/mise.toml)
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.27.2"
+          cache: false
+      # Upstream's feature matrix, which its removed workflows built: the fork must still
+      # compile without std and with either provider, though FAIM builds only one.
+      - name: Feature builds
+        working-directory: rustls
+        run: |
+          cargo check -p rustls --no-default-features
+          cargo check -p rustls --no-default-features --features aws_lc_rs
+          cargo check -p rustls --no-default-features --features ring,std
+          cargo check -p rustls --no-default-features --features aws_lc_rs,std,tls12
+      - name: rustls's tests
+        working-directory: rustls
+        run: cargo test -p rustls
+      - name: BoGo
+        working-directory: rustls/bogo
+        run: ./runme
