@@ -8,6 +8,7 @@ use subtle::ConstantTimeEq;
 
 use super::hs::{self, HandshakeHashOrBuffer, ServerContext};
 use super::server_conn::ServerConnectionData;
+use super::template;
 use crate::check::{inappropriate_handshake_message, inappropriate_message};
 use crate::common_state::{
     CommonState, HandshakeFlightTls13, HandshakeKind, Protocol, Side, State,
@@ -75,6 +76,8 @@ mod client_hello {
         pub(in crate::server) previous_hello: Option<PreviousClientHello>,
         pub(in crate::server) send_tickets: usize,
         pub(in crate::server) extra_exts: ServerExtensionsInput<'static>,
+        /// FAIM: the server template's answer, if one answers this client.
+        pub(in crate::server) answer: Option<faim_template::Answer>,
     }
 
     fn max_early_data_size(configured: u32) -> usize {
@@ -178,17 +181,22 @@ mod client_hello {
                 ));
             }
 
-            let cert_compressor = client_hello
-                .certificate_compression_algorithms
-                .as_ref()
-                .and_then(|offered|
+            // FAIM: the server template's algorithm, where it compressed its certificate.
+            let cert_compressor = if let Some(answer) = &self.answer {
+                template::compressor(answer, &self.config, cx)
+            } else {
+                client_hello
+                    .certificate_compression_algorithms
+                    .as_ref()
+                    .and_then(|offered|
                     // prefer server order when choosing a compression: the client's
                     // extension here does not denote any preference.
                     self.config
                         .cert_compressors
                         .iter()
                         .find(|compressor| offered.contains(&compressor.algorithm()))
-                        .cloned());
+                        .cloned())
+            };
 
             let early_data_requested = client_hello
                 .early_data_request
@@ -277,7 +285,13 @@ mod client_hello {
             let mut chosen_psk_index = None;
             let mut resumedata = None;
 
-            if let Some(psk_offer) = &client_hello.preshared_key_offer {
+            // FAIM: a server template answers in full, since its ServerHello names no PSK
+            // until faim-http#199 mirrors resumption.
+            if let Some(psk_offer) = client_hello
+                .preshared_key_offer
+                .as_ref()
+                .filter(|_| self.answer.is_none())
+            {
                 // "A client MUST provide a "psk_key_exchange_modes" extension if it
                 //  offers a "pre_shared_key" extension. If clients offer
                 //  "pre_shared_key" without a "psk_key_exchange_modes" extension,
@@ -390,6 +404,7 @@ mod client_hello {
                     .as_ref()
                     .map(|x| &x.master_secret.0[..]),
                 &self.config,
+                self.answer.as_ref(),
             )?;
             if !self.previous_hello.is_some() {
                 emit_fake_ccs(cx.common);
@@ -404,6 +419,10 @@ mod client_hello {
             }
 
             let mut ocsp_response = server_key.get_ocsp();
+            // FAIM: stapled where the server template's answer staples.
+            if let Some(answer) = &mut self.answer {
+                ocsp_response = template::staple(answer, ocsp_response, cx);
+            }
             let mut flight = HandshakeFlightTls13::new(&mut self.transcript);
             let doing_early_data = emit_encrypted_extensions(
                 &mut flight,
@@ -415,6 +434,7 @@ mod client_hello {
                 self.extra_exts,
                 &self.config,
                 self.send_tickets,
+                self.answer.as_ref(),
             )?;
 
             let doing_client_auth = if full_handshake {
@@ -534,6 +554,7 @@ mod client_hello {
         chosen_psk_idx: Option<usize>,
         resuming_psk: Option<&[u8]>,
         config: &ServerConfig,
+        answer: Option<&faim_template::Answer>,
     ) -> Result<KeyScheduleHandshake, Error> {
         // Prepare key exchange; the caller already found the matching SupportedKxGroup
         let (share, kxgroup) = share_and_kxgroup;
@@ -546,25 +567,39 @@ mod client_hello {
             })?;
         cx.common.kx_state.complete();
 
-        let extensions = Box::new(ServerExtensions {
-            key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
-            selected_version: Some(ProtocolVersion::TLSv1_3),
-            preshared_key: chosen_psk_idx.map(|idx| idx as u16),
-            ..Default::default()
-        });
-
-        let sh = Message {
-            version: ProtocolVersion::TLSv1_2,
-            payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::ServerHello(ServerHelloPayload {
-                    legacy_version: ProtocolVersion::TLSv1_2,
-                    random: Random::from(randoms.server),
-                    session_id: *session_id,
-                    cipher_suite: suite.common.suite,
-                    compression_method: Compression::Null,
-                    extensions,
-                }),
-            )),
+        let sh = match answer {
+            // FAIM: the server template's `ServerHello`, as it renders.
+            Some(answer) => Message {
+                version: template::record_version(answer),
+                payload: MessagePayload::handshake(template::server_hello(
+                    answer,
+                    randoms.server,
+                    session_id.as_ref(),
+                    suite.common.suite,
+                    Some((ckx.group, &ckx.pub_key)),
+                )?),
+            },
+            None => {
+                let extensions = Box::new(ServerExtensions {
+                    key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
+                    selected_version: Some(ProtocolVersion::TLSv1_3),
+                    preshared_key: chosen_psk_idx.map(|idx| idx as u16),
+                    ..Default::default()
+                });
+                Message {
+                    version: ProtocolVersion::TLSv1_2,
+                    payload: MessagePayload::handshake(HandshakeMessagePayload(
+                        HandshakePayload::ServerHello(ServerHelloPayload {
+                            legacy_version: ProtocolVersion::TLSv1_2,
+                            random: Random::from(randoms.server),
+                            session_id: *session_id,
+                            cipher_suite: suite.common.suite,
+                            compression_method: Compression::Null,
+                            extensions,
+                        }),
+                    )),
+                }
+            }
         };
 
         cx.common.check_aligned_handshake()?;
@@ -720,7 +755,19 @@ mod client_hello {
         extra_exts: ServerExtensionsInput<'static>,
         config: &ServerConfig,
         send_tickets: usize,
+        answer: Option<&faim_template::Answer>,
     ) -> Result<EarlyDataDecision, Error> {
+        // FAIM: the server template's `EncryptedExtensions`, as it renders. Nothing here
+        // resumes, so early data is never accepted.
+        if let Some(answer) = answer {
+            flight.add(template::encrypted_extensions(
+                answer,
+                cx,
+                config.max_fragment_size,
+            )?);
+            return Ok(decide_if_early_data_allowed(cx, hello, None, suite, config));
+        }
+
         let mut ep = hs::ExtensionProcessing::new(extra_exts);
         ep.process_common(
             config,
@@ -941,13 +988,20 @@ struct ExpectCertificateOrCompressedCertificate {
 
 impl State<ServerConnectionData> for ExpectCertificateOrCompressedCertificate {
     fn handle<'m>(
-        self: Box<Self>,
+        mut self: Box<Self>,
         cx: &mut ServerContext<'_>,
         m: Message<'m>,
     ) -> hs::NextStateOrError<'m>
     where
         Self: 'm,
     {
+        // FAIM: a client that agreed to the server template's ALPS sends its own
+        // `EncryptedExtensions` before its certificate.
+        if cx.data.template_alps.is_some() {
+            template::read_client_encrypted_extensions(cx, &m, &mut self.transcript)?;
+            return Ok(self);
+        }
+
         match m.payload {
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::CertificateTls13(..)),
@@ -1105,6 +1159,13 @@ impl State<ServerConnectionData> for ExpectCertificate {
     where
         Self: 'm,
     {
+        // FAIM: a client that agreed to the server template's ALPS sends its own
+        // `EncryptedExtensions` before its certificate.
+        if cx.data.template_alps.is_some() {
+            template::read_client_encrypted_extensions(cx, &m, &mut self.transcript)?;
+            return Ok(self);
+        }
+
         if !self.message_already_in_transcript {
             self.transcript.add_message(&m);
         }
@@ -1418,6 +1479,13 @@ impl State<ServerConnectionData> for ExpectFinished {
     where
         Self: 'm,
     {
+        // FAIM: a client that agreed to the server template's ALPS sends its own
+        // `EncryptedExtensions` before its `Finished`.
+        if cx.data.template_alps.is_some() {
+            template::read_client_encrypted_extensions(cx, &m, &mut self.transcript)?;
+            return Ok(self);
+        }
+
         let finished =
             require_handshake_msg!(m, HandshakeType::Finished, HandshakePayload::Finished)?;
 

@@ -57,5 +57,30 @@ A change that touches both repositories merges here first. faim-http then pins t
 
 ## The server
 
-- **`ServerConfig::ech_retry_configs`** (`server/server_conn.rs`, default `None` in `server/builder.rs`; sent from `server/tls13.rs`): ECH configs to send a client that offered ECH, since the server accepts none (RFC 9849 §7.1). Configs that don't parse, or parse to an empty list the extension doesn't allow, are left out with a warning rather than failing the handshake after `ServerHello` or sending an invalid extension. FAIM's test harness uses it to show that a greased ECH ignores them (faim-http#200), and faim-http#196 mirrors a server's own.
+- **`ServerConfig::ech_retry_configs`** (`server/server_conn.rs`, default `None` in `server/builder.rs`; sent from `server/tls13.rs`): ECH configs to send a client that offered ECH, since the server accepts none (RFC 9849 §7.1). Configs that don't parse, or parse to an empty list the extension doesn't allow, are left out with a warning rather than failing the handshake after `ServerHello` or sending an invalid extension. FAIM's test harness uses it to show that a greased ECH ignores them (faim-http#200). A server template sends the server's own as part of its `EncryptedExtensions`, in their place.
 - **`server/tls13.rs`**: a client certificate entry with an extension rustls doesn't handle is refused here, where decoding used to refuse it (see `CertificateExtensions` above).
+
+## The server answers from a server template (faim-http#196)
+
+FAIM answers its client in the shape of the answer the real server gave (its ADR-0011), so the client sees the server's JA4S, ALPN and ALPS. The template is plain data in faim-http's `crates/faim-template` (`ServerTemplate`), which fits it to the client's hello as an `Answer`: what of the server's answer goes out to this client, and what is left out as a `ServerShortfall`. The fork only picks what the answer names and sends what it renders.
+
+- **`ServerConfig::hello_template`** (`server/server_conn.rs`, default `None` in `server/builder.rs`): the server's answer to answer the client with. `None` leaves the server stock. The template's ALPN takes the place of `alpn_protocols`.
+- **`ServerConnection::template_shortfalls`** and `ServerConnectionData::template_shortfalls` (`server/server_conn.rs`): what of the template the connection couldn't send its client, for faim-http#197 to record on the connection.
+- **`server/template.rs`** (new) holds the steps below, which the handshake calls.
+- **`server/hs.rs`**, on a first hello:
+  - The client's hello is read back with faim-template (`ClientHello::from_message`, from the hello's encoded bytes, so the extensions rustls doesn't parse count too) and the template fitted to it. A template that can't answer this client (another version, no key share for the server's group, a QUIC connection, a hello faim-template doesn't read) is a shortfall, and the server answers stock.
+  - The template's version takes the place of rustls's pick: TLS 1.2 where the server answered in TLS 1.2, even to a client offering TLS 1.3 (faim-template refuses a template whose random says the server speaks TLS 1.3, which such a client would refuse).
+  - The template's suite and group take the place of rustls's picks, where the crypto provider completes them. A suite it can't is a shortfall and rustls's pick stays. A group it can't drops the template, whose `ServerHello` names the group, and is checked before the template's version replaces rustls's: a TLS 1.2 template dropped after that would leave a client offering TLS 1.3 a stock TLS 1.2 answer carrying rustls's downgrade marker, which it refuses.
+  - The server random ends with the template's downgrade marker where the server's did, and rustls's own marker is left off.
+- **`server/tls13.rs`**:
+  - `ServerHello`: the template's, rendered with the connection's random, the client's session id, the suite and the key share, and sent as rendered (`HandshakePayload::Unknown`), so its extensions keep the server's order.
+  - `EncryptedExtensions`: the template's, rendered and sent as rendered. Its ALPN protocol becomes the connection's; a `record_size_limit` or `max_fragment_length` it agrees to caps what the server sends, below a smaller `ServerConfig::max_fragment_size`, which stays; early data is never accepted.
+  - No PSK is accepted: the template's `ServerHello` names none until faim-http#199 mirrors resumption, so a client offering one gets a full handshake.
+  - `Certificate`: compressed with the template's algorithm where the server compressed its own and the config has a compressor for it, uncompressed otherwise; an OCSP response stapled only where the template's answer staples one, and a shortfall where it does and the certified key has none.
+  - `ExpectFinished`, `ExpectCertificate` and `ExpectCertificateOrCompressedCertificate`: a client that agreed to the template's ALPS sends its own `EncryptedExtensions` first, before its certificate when asked for one and otherwise before its `Finished`, as Chromium does; it goes into the transcript.
+- **`server/tls12.rs`**:
+  - `ServerHello`: the template's, rendered with the connection's random, an empty session id and the suite, and sent as rendered. No ticket is issued, and a ticket or session id the client offers isn't resumed, since a resumed handshake would send rustls's own `ServerHello` (faim-http#199). ALPN and record size limits apply as on TLS 1.3.
+  - Extended master secret only where the template's answer agreed to it.
+  - `ServerKeyExchange`: signed with the template's scheme where the client offered it and the key signs with it, else rustls's pick and a shortfall.
+  - `CertificateStatus`: sent where the template's answer staples, as on TLS 1.3; where the key has no response, `status_request` is left out of the `ServerHello` too.
+

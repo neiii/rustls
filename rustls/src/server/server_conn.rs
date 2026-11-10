@@ -464,6 +464,15 @@ pub struct ServerConfig {
     /// `ECHConfigList`, since this server accepts none. A client that greased ECH
     /// ignores them. `None` (the default) sends none.
     pub ech_retry_configs: Option<pki_types::EchConfigListBytes<'static>>,
+
+    /// FAIM: the answer a real server gave, to answer the client with in its shape
+    /// (faim-http#196): its version, suite and group where the fork completes them,
+    /// and its `ServerHello` and `EncryptedExtensions` as it sent them, so the client
+    /// sees the server's JA4S, ALPN and ALPS. What the client didn't offer, or the fork
+    /// can't send, is left out and listed by `ServerConnection::template_shortfalls`.
+    /// The template's ALPN takes the place of `alpn_protocols`. `None` (the default)
+    /// leaves the server stock.
+    pub hello_template: Option<Arc<faim_template::ServerTemplate>>,
 }
 
 impl ServerConfig {
@@ -710,6 +719,13 @@ mod connection {
         pub fn set_resumption_data(&mut self, data: &[u8]) {
             assert!(data.len() < 2usize.pow(15));
             self.inner.core.data.resumption_data = data.into();
+        }
+
+        /// FAIM: what of `ServerConfig::hello_template` this connection couldn't send its
+        /// client, in the order met (faim-http#196). Empty without a template, and
+        /// complete once the handshake is.
+        pub fn template_shortfalls(&self) -> &[faim_template::ServerShortfall] {
+            &self.inner.core.data.template_shortfalls
         }
 
         /// Explicitly discard early data, notifying the client
@@ -1261,6 +1277,11 @@ pub struct ServerConnectionData {
     pub(super) received_resumption_data: Option<Vec<u8>>,
     pub(super) resumption_data: Vec<u8>,
     pub(super) early_data: EarlyDataState,
+    /// FAIM: what of the server template the connection couldn't send its client.
+    pub(super) template_shortfalls: Vec<faim_template::ServerShortfall>,
+    /// FAIM: the ALPS codepoint the template agreed to, while the client's own
+    /// `EncryptedExtensions` is still to come.
+    pub(super) template_alps: Option<u16>,
 }
 
 impl ServerConnectionData {

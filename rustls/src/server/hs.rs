@@ -28,7 +28,7 @@ use crate::msgs::handshake::{
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::server::common::ActiveCertifiedKey;
-use crate::server::{ClientHello, ServerConfig, tls13};
+use crate::server::{ClientHello, ServerConfig, template, tls13};
 use crate::sync::Arc;
 use crate::{SupportedCipherSuite, suites};
 
@@ -393,6 +393,26 @@ impl ExpectClientHello {
             ProtocolVersion::TLSv1_2
         };
 
+        // FAIM: the server template's answer to a first hello, whose version takes the
+        // place of rustls's pick. A template that can't answer leaves the server stock.
+        let mut answer = match self.previous_hello {
+            None => template::answer(&self.config, m, cx),
+            Some(_) => None,
+        };
+        let mut version = version;
+        if let Some(fitted) = &answer {
+            match template::version(
+                fitted,
+                &self.config,
+                version,
+                tls12_enabled && !cx.common.is_quic(),
+                cx,
+            ) {
+                Some(wanted) => version = wanted,
+                None => answer = None,
+            }
+        }
+
         cx.common.negotiated_version = Some(version);
 
         // We communicate to the upper layer what kind of key they should choose
@@ -471,6 +491,24 @@ impl ExpectClientHello {
                     .send_fatal_alert(AlertDescription::HandshakeFailure, incompat)
             })?;
 
+        // FAIM: the server template's suite and group, where the fork completes them.
+        let (suite, skxg) = match &mut answer {
+            Some(fitted) => {
+                let picked = template::suite_and_group(
+                    fitted,
+                    &self.config,
+                    version,
+                    certkey.get_key().algorithm(),
+                    cx.common.protocol,
+                    (suite, skxg),
+                    cx,
+                );
+                template::adopt(fitted, cx);
+                picked
+            }
+            None => (suite, skxg),
+        };
+
         // RFC 9846 section 4.2.4: the server must negotiate the same cipher suite it
         // named in its HelloRetryRequest
         if let Some(PreviousClientHello {
@@ -508,10 +546,16 @@ impl ExpectClientHello {
         };
 
         // Save their Random.
-        let randoms = ConnectionRandoms::new(
+        let mut randoms = ConnectionRandoms::new(
             client_hello.random,
             Random::new(self.config.provider.secure_random)?,
         );
+        // FAIM: ending with the downgrade marker where the server's did, in place of
+        // rustls's own.
+        let marks_downgrade = tls13_enabled && answer.is_none();
+        if let Some(fitted) = &answer {
+            randoms.server = fitted.server_random(randoms.server);
+        }
         match suite {
             SupportedCipherSuite::Tls13(suite) => tls13::CompleteClientHelloHandling {
                 config: self.config,
@@ -521,6 +565,7 @@ impl ExpectClientHello {
                 previous_hello: self.previous_hello,
                 send_tickets: self.send_tickets,
                 extra_exts: self.extra_exts,
+                answer,
             }
             .handle_client_hello(cx, certkey, m, client_hello, skxg, sig_schemes),
             #[cfg(feature = "tls12")]
@@ -533,6 +578,7 @@ impl ExpectClientHello {
                 randoms,
                 send_ticket: self.send_tickets > 0,
                 extra_exts: self.extra_exts,
+                answer,
             }
             .handle_client_hello(
                 cx,
@@ -541,7 +587,7 @@ impl ExpectClientHello {
                 client_hello,
                 skxg,
                 sig_schemes,
-                tls13_enabled,
+                marks_downgrade,
             ),
         }
     }

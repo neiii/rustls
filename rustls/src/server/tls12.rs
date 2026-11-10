@@ -10,6 +10,7 @@ use subtle::ConstantTimeEq;
 use super::common::ActiveCertifiedKey;
 use super::hs::{self, ServerContext};
 use super::server_conn::{ProducesTickets, ServerConfig, ServerConnectionData};
+use super::template;
 use crate::check::inappropriate_message;
 use crate::common_state::{CommonState, HandshakeFlightTls12, HandshakeKind, Side, State};
 use crate::conn::ConnectionRandoms;
@@ -58,6 +59,8 @@ mod client_hello {
         pub(in crate::server) randoms: ConnectionRandoms,
         pub(in crate::server) send_ticket: bool,
         pub(in crate::server) extra_exts: ServerExtensionsInput<'static>,
+        /// FAIM: the server template's answer, if one answers this client.
+        pub(in crate::server) answer: Option<faim_template::Answer>,
     }
 
     impl CompleteClientHelloHandling {
@@ -77,6 +80,11 @@ mod client_hello {
             if client_hello
                 .extended_master_secret_request
                 .is_some()
+                // FAIM: unless the server template's answer didn't agree to it.
+                && self
+                    .answer
+                    .as_ref()
+                    .is_none_or(|answer| answer.extended_master_secret)
             {
                 self.using_ems = true;
             } else if self.config.require_ems {
@@ -104,6 +112,7 @@ mod client_hello {
             }
 
             // -- If TLS1.3 is enabled, signal the downgrade in the server random
+            // FAIM: the caller passes false when a server template marks it instead.
             if tls13_enabled {
                 self.randoms.server[24..].copy_from_slice(&tls12::DOWNGRADE_SENTINEL);
             }
@@ -153,7 +162,15 @@ mod client_hello {
                 })
                 .and_then(|x| persist::ServerSessionValue::read_bytes(&x).ok())
                 .filter(|resumedata| {
-                    hs::can_resume(self.suite.into(), &cx.data.sni, self.using_ems, resumedata)
+                    // FAIM: a server template answers in full, since resuming would send
+                    // rustls's own ServerHello (faim-http#199 mirrors resumption).
+                    self.answer.is_none()
+                        && hs::can_resume(
+                            self.suite.into(),
+                            &cx.data.sni,
+                            self.using_ems,
+                            resumedata,
+                        )
                 });
 
             if let Some(data) = resume_data {
@@ -173,12 +190,24 @@ mod client_hello {
             }
 
             let mut ocsp_response = server_key.get_ocsp();
+            // FAIM: the server template's signature scheme, and its staple.
+            let sigschemes = match &mut self.answer {
+                Some(answer) => {
+                    ocsp_response = template::staple(answer, ocsp_response, cx);
+                    template::key_exchange_schemes(answer, sigschemes, server_key.get_key(), cx)
+                }
+                None => sigschemes,
+            };
 
             // If we're not offered a ticket or a potential session ID, allocate a session ID.
             if !self.config.session_storage.can_cache() {
                 self.session_id = SessionId::empty();
             } else if self.session_id.is_empty() && !ticket_received {
                 self.session_id = SessionId::random(self.config.provider.secure_random)?;
+            }
+            // FAIM: no session to resume until faim-http#199 mirrors resumption.
+            if self.answer.is_some() {
+                self.session_id = SessionId::empty();
             }
 
             cx.common.kx_state = KxState::Start(selected_kxg);
@@ -198,6 +227,7 @@ mod client_hello {
                 None,
                 &self.randoms,
                 self.extra_exts,
+                self.answer.as_ref(),
             )?;
             emit_certificate(&mut flight, server_key.get_cert());
             if let Some(ocsp_response) = ocsp_response {
@@ -271,6 +301,7 @@ mod client_hello {
                 Some(&resumedata),
                 &self.randoms,
                 self.extra_exts,
+                None,
             )?;
             flight.finish(cx.common);
 
@@ -331,7 +362,26 @@ mod client_hello {
         resumedata: Option<&persist::ServerSessionValue>,
         randoms: &ConnectionRandoms,
         extra_exts: ServerExtensionsInput<'static>,
+        answer: Option<&faim_template::Answer>,
     ) -> Result<bool, Error> {
+        // FAIM: the server template's `ServerHello`, as it renders. It issues no ticket.
+        if let Some(answer) = answer {
+            template::agree(
+                answer,
+                cx,
+                ProtocolVersion::TLSv1_2,
+                config.max_fragment_size,
+            )?;
+            flight.add(template::server_hello(
+                answer,
+                randoms.server,
+                session_id.as_ref(),
+                suite.common.suite,
+                None,
+            )?);
+            return Ok(false);
+        }
+
         let mut ep = hs::ExtensionProcessing::new(extra_exts);
         ep.process_common(config, cx, ocsp_response, hello, resumedata)?;
         ep.process_tls12(config, hello, using_ems);
