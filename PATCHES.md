@@ -13,7 +13,7 @@ The fork's `rustls` crate depends on `faim-template = "0.1"`, which crates.io do
 - rustls's own tests: `cargo test -p rustls`.
 - BoGo: `cd bogo && BOGO_SHIM_PROVIDER=aws-lc-rs ./runme`, with Go installed.
 
-The `faim` workflow (`.github/workflows/faim.yml`) runs both on every push and pull request to this branch. faim-http is private, so the workflow checks it out with the `FAIM_HTTP_TOKEN` secret, a fine-grained token with Contents: read on `neiii/faim-http`. It builds against faim-http's `master` unless it's started by hand with another `faim-http-ref`, which a change to faim-template's interface needs before faim-http merges it.
+The `faim` workflow (`.github/workflows/faim.yml`) runs both on every push and pull request to this branch. faim-http is private, so the workflow checks it out with the `FAIM_HTTP_TOKEN` secret, a fine-grained token with Contents: read on `neiii/faim-http`. It builds against the faim-http ref named in `FAIM_HTTP_REF`, a one-line file at the root: `master` normally, or a faim-http branch while a change here needs a faim-template change faim-http hasn't merged yet. Set it back to `master` once that branch merges. A run started by hand can name another ref with `faim-http-ref`.
 
 A change that touches both repositories merges here first. faim-http then pins the new commit.
 
@@ -22,6 +22,7 @@ A change that touches both repositories merges here first. faim-http then pins t
 - **`Cargo.toml`**: `[patch.crates-io]` supplies `faim-template` from `../faim-http` (see above).
 - **`Cargo.lock`**: `aws-lc-rs` 1.19.0 and `aws-lc-sys` 0.47.0, the versions FAIM builds with, so the fork's tests run on the crypto FAIM ships, and `faim-template` with its dependencies. A change that bumps `aws-lc-rs` in faim-http's `Cargo.lock` bumps it here too (`cargo update -p aws-lc-rs --precise <version>`).
 - **`rustls/Cargo.toml`**: depends on `faim-template = "0.1"`.
+- **`FAIM_HTTP_REF`** (new): the faim-http ref the `faim` workflow builds faim-template from (see above).
 - **`.github/workflows/`**: upstream's workflows are removed. They build without faim-template, so every one would fail here, and FAIM doesn't need their release, fuzzing or docs jobs. `faim.yml` replaces them.
 
 ## The client sends a template's hello

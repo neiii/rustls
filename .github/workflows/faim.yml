@@ -12,8 +12,8 @@ on:
   workflow_dispatch:
     inputs:
       faim-http-ref:
-        description: "The faim-http branch, tag or commit to build faim-template from"
-        default: master
+        description: "The faim-http branch, tag or commit to build faim-template from, in place of FAIM_HTTP_REF's"
+        required: false
 
 permissions:
   contents: read
@@ -37,11 +37,22 @@ jobs:
         with:
           path: rustls
           persist-credentials: false
+      # FAIM_HTTP_REF names the faim-http ref whose faim-template this commit builds with,
+      # so a pull request that needs an unmerged faim-http change can name its branch.
+      - name: Read the faim-http ref
+        id: faim-http
+        env:
+          OVERRIDE: ${{ inputs.faim-http-ref }}
+        run: |
+          ref=${OVERRIDE:-$(tr -d '[:space:]' < rustls/FAIM_HTTP_REF)}
+          test -n "$ref"
+          echo "Building against faim-http $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
       # The workspace's [patch.crates-io] takes faim-template from ../faim-http.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: neiii/faim-http
-          ref: ${{ inputs.faim-http-ref || 'master' }}
+          ref: ${{ steps.faim-http.outputs.ref }}
           token: ${{ secrets.FAIM_HTTP_TOKEN }}
           path: faim-http
           persist-credentials: false
