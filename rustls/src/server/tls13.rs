@@ -1119,6 +1119,19 @@ impl State<ServerConnectionData> for ExpectCertificate {
             ));
         }
 
+        // FAIM: the certificate entry extensions decoding no longer refuses. A server
+        // offers none, so it refuses them all here.
+        if certp
+            .unknown_extensions()
+            .next()
+            .is_some()
+        {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::DecodeError,
+                InvalidMessage::UnknownCertificateExtension,
+            ));
+        }
+
         // We don't send any CertificateRequest extensions, so any extensions
         // here are illegal.
         if certp

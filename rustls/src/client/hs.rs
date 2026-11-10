@@ -41,6 +41,9 @@ use crate::sync::Arc;
 use crate::tls13::key_schedule::KeyScheduleEarly;
 use crate::verify::ServerCertVerifier;
 
+/// FAIM: sending a hello from a template (PATCHES.md).
+pub(super) mod template;
+
 pub(super) type NextState<'a> = Box<dyn State<ClientConnectionData> + 'a>;
 pub(super) type NextStateOrError<'a> = Result<NextState<'a>, Error>;
 pub(super) type ClientContext<'a> = crate::common_state::Context<'a, ClientConnectionData>;
@@ -57,6 +60,8 @@ struct ExpectServerHello {
     // If this is `None` then we do not support early data.
     early_data_key_schedule: Option<KeyScheduleEarly>,
     offered_key_share: Option<Box<dyn ActiveKeyExchange>>,
+    /// FAIM: the key shares a template's hello offered beside `offered_key_share`.
+    template_shares: Vec<Box<dyn ActiveKeyExchange>>,
     suite: Option<SupportedCipherSuite>,
     ech_state: Option<EchState>,
 }
@@ -75,6 +80,11 @@ pub(super) struct ClientHelloInput {
     pub(super) session_id: SessionId,
     pub(super) server_name: ServerName<'static>,
     pub(super) prev_ech_ext: Option<EncryptedClientHello>,
+    /// FAIM: the ECH bytes a template's first hello sent, which a retry sends again.
+    pub(super) template_ech: Option<faim_template::EchPayload>,
+    /// FAIM: the key shares a template's hello sent, whose bytes a retry that asks for
+    /// no group sends again.
+    pub(super) template_key_shares: Vec<faim_template::KeyShare>,
 }
 
 impl ClientHelloInput {
@@ -84,7 +94,11 @@ impl ClientHelloInput {
         cx: &mut ClientContext<'_>,
         config: Arc<ClientConfig>,
     ) -> Result<Self, Error> {
-        let mut resuming = ClientSessionValue::retrieve(&server_name, &config, cx);
+        // FAIM: a hello from a template offers no session to resume (faim-http#199).
+        let mut resuming = match config.hello_template {
+            Some(_) => None,
+            None => ClientSessionValue::retrieve(&server_name, &config, cx),
+        };
         let session_id = match &mut resuming {
             Some(_resuming) => {
                 debug!("Resuming session");
@@ -110,13 +124,18 @@ impl ClientHelloInput {
 
         // https://tools.ietf.org/html/rfc8446#appendix-D.4
         // https://tools.ietf.org/html/draft-ietf-quic-tls-34#section-8.4
-        let session_id = match session_id {
-            Some(session_id) => session_id,
-            None if cx.common.is_quic() => SessionId::empty(),
-            None if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) => {
+        let session_id = match (&config.hello_template, session_id) {
+            (Some(hello_template), _) => {
+                template::session_id(hello_template, config.provider.secure_random)?
+            }
+            (None, Some(session_id)) => session_id,
+            (None, None) if cx.common.is_quic() => SessionId::empty(),
+            (None, None)
+                if !config.supports_version(ProtocolVersion::TLSv1_3, cx.common.protocol) =>
+            {
                 SessionId::empty()
             }
-            None => SessionId::random(config.provider.secure_random)?,
+            (None, None) => SessionId::random(config.provider.secure_random)?,
         };
 
         let hello = ClientHelloDetails::new(
@@ -135,6 +154,8 @@ impl ClientHelloInput {
             session_id,
             server_name,
             prev_ech_ext: None,
+            template_ech: None,
+            template_key_shares: Vec::new(),
             config,
         })
     }
@@ -151,6 +172,19 @@ impl ClientHelloInput {
             .has_certs()
         {
             transcript_buffer.set_client_auth_enabled();
+        }
+
+        // FAIM: a template's hello makes its own key shares.
+        if let Some(hello_template) = self.config.hello_template.clone() {
+            return template::emit_client_hello(
+                hello_template,
+                transcript_buffer,
+                None,
+                Vec::new(),
+                extra_exts,
+                self,
+                cx,
+            );
         }
 
         let key_share = if self.config.needs_key_share() {
@@ -528,6 +562,7 @@ fn emit_client_hello_for_retry(
         transcript_buffer,
         early_data_key_schedule,
         offered_key_share: key_share,
+        template_shares: Vec::new(),
         suite,
         ech_state,
     };
@@ -694,7 +729,15 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
         let config = &self.input.config;
-        let tls13_supported = config.supports_version(TLSv1_3, cx.common.protocol);
+        // FAIM: a template that offered no TLS 1.3 takes a server's TLS 1.2 as it is,
+        // downgrade marker and all.
+        let tls13_supported = config.supports_version(TLSv1_3, cx.common.protocol)
+            && config
+                .hello_template
+                .as_deref()
+                .is_none_or(|hello_template| {
+                    hello_template.offers_version(template::protocol_version(TLSv1_3))
+                });
 
         let server_version = if server_hello.legacy_version == TLSv1_2 {
             server_hello
@@ -703,6 +746,11 @@ impl State<ClientConnectionData> for ExpectServerHello {
         } else {
             server_hello.legacy_version
         };
+
+        // FAIM: a template's version is one it offered, and one the fork speaks.
+        if let Some(hello_template) = config.hello_template.as_deref() {
+            template::check_version(cx.common, hello_template, server_version)?;
+        }
 
         let version = match server_version {
             TLSv1_3 if tls13_supported => TLSv1_3,
@@ -758,6 +806,11 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         cx.common.negotiated_version = Some(version);
 
+        // FAIM: a TLS 1.2 server's `record_size_limit` caps what the client sends.
+        if version == TLSv1_2 && config.hello_template.is_some() {
+            template::apply_record_size_limit(cx.common, server_hello, version)?;
+        }
+
         // Extract ALPN protocol
         if !cx.common.is_tls13() {
             process_alpn_protocol(
@@ -789,6 +842,18 @@ impl State<ClientConnectionData> for ExpectServerHello {
             .contains(&server_hello.cipher_suite)
             .then(|| config.find_cipher_suite(server_hello.cipher_suite, cx.common.protocol))
         else {
+            // FAIM: a template offers suites the fork can't complete.
+            if let Some(hello_template) = config.hello_template.as_deref() {
+                return Err(template::unknown_cipher_suite(
+                    cx.common,
+                    hello_template,
+                    server_hello.cipher_suite,
+                    (
+                        AlertDescription::HandshakeFailure,
+                        PeerMisbehaved::SelectedUnofferedCipherSuite,
+                    ),
+                ));
+            }
             return Err(cx.common.send_fatal_alert(
                 AlertDescription::HandshakeFailure,
                 PeerMisbehaved::SelectedUnofferedCipherSuite,
@@ -831,6 +896,19 @@ impl State<ClientConnectionData> for ExpectServerHello {
         // handshake_traffic_secret.
         match suite {
             SupportedCipherSuite::Tls13(suite) => {
+                // FAIM: a template's hello may offer several key shares.
+                let offered_key_share = match config.hello_template.as_deref() {
+                    Some(hello_template) => template::choose_key_share(
+                        self.offered_key_share,
+                        self.template_shares,
+                        server_hello,
+                        hello_template,
+                        config,
+                        cx,
+                    )?,
+                    // We always send a key share when TLS 1.3 is enabled.
+                    None => self.offered_key_share.unwrap(),
+                };
                 tls13::handle_server_hello(
                     cx,
                     server_hello,
@@ -838,8 +916,7 @@ impl State<ClientConnectionData> for ExpectServerHello {
                     suite,
                     transcript,
                     self.early_data_key_schedule,
-                    // We always send a key share when TLS 1.3 is enabled.
-                    self.offered_key_share.unwrap(),
+                    offered_key_share,
                     &m,
                     self.ech_state,
                     self.input,
@@ -879,22 +956,36 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         cx.common.check_aligned_handshake()?;
 
+        let config = &self.next.input.config;
+        // FAIM: a template's hello, which may have sent no key share the fork can
+        // complete.
+        let hello_template = config.hello_template.clone();
+
         // We always send a key share when TLS 1.3 is enabled.
-        let offered_key_share = self.next.offered_key_share.unwrap();
+        let offered_key_share = self.next.offered_key_share;
 
         // A retry request is illegal if it contains no cookie and asks for
         // retry of a group we already sent.
-        let config = &self.next.input.config;
 
         if let (None, Some(req_group)) = (&hrr.cookie, hrr.key_share) {
             let offered_hybrid = offered_key_share
-                .hybrid_component()
+                .as_ref()
+                .and_then(|share| share.hybrid_component())
                 .and_then(|(group_name, _)| {
                     config.find_kx_group(group_name, ProtocolVersion::TLSv1_3)
                 })
                 .map(|skxg| skxg.name());
 
-            if req_group == offered_key_share.group() || Some(req_group) == offered_hybrid {
+            let already_sent = match hello_template.as_deref() {
+                Some(hello_template) => template::sent_key_share(hello_template, req_group),
+                None => {
+                    offered_key_share
+                        .as_ref()
+                        .is_some_and(|share| req_group == share.group())
+                        || Some(req_group) == offered_hybrid
+                }
+            };
+            if already_sent {
                 return Err({
                     cx.common.send_fatal_alert(
                         AlertDescription::IllegalParameter,
@@ -965,6 +1056,18 @@ impl ExpectServerHelloOrHelloRetryRequest {
 
         // Or asks us to use a ciphersuite we didn't offer.
         let Some(cs) = config.find_cipher_suite(hrr.cipher_suite, cx.common.protocol) else {
+            // FAIM: a template offers suites the fork can't complete.
+            if let Some(hello_template) = hello_template.as_deref() {
+                return Err(template::unknown_cipher_suite(
+                    cx.common,
+                    hello_template,
+                    hrr.cipher_suite,
+                    (
+                        AlertDescription::IllegalParameter,
+                        PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedCipherSuite,
+                    ),
+                ));
+            }
             return Err({
                 cx.common.send_fatal_alert(
                     AlertDescription::IllegalParameter,
@@ -1019,6 +1122,51 @@ impl ExpectServerHelloOrHelloRetryRequest {
         if cx.data.early_data.is_enabled() {
             cx.data.early_data.rejected();
         }
+
+        // FAIM: a template's hello is reshaped the way its client would, and offers
+        // again every key share it still can. What the retry asks for must be what the
+        // template offered.
+        if let Some(hello_template) = hello_template {
+            if hrr
+                .key_share
+                .is_some_and(|group| !hello_template.offers_group(template::named_group(group)))
+            {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedNamedGroup,
+                ));
+            }
+            if !hello_template.offers_cipher_suite(template::cipher_suite(hrr.cipher_suite)) {
+                return Err(cx.common.send_fatal_alert(
+                    AlertDescription::IllegalParameter,
+                    PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedCipherSuite,
+                ));
+            }
+            let shares = offered_key_share
+                .into_iter()
+                .chain(self.next.template_shares)
+                .collect();
+            return template::emit_client_hello(
+                hello_template,
+                transcript_buffer,
+                Some(template::Retry {
+                    request: hrr,
+                    suite: cs,
+                }),
+                shares,
+                self.extra_exts,
+                self.next.input,
+                cx,
+            );
+        }
+
+        // We always send a key share when TLS 1.3 is enabled.
+        let Some(offered_key_share) = offered_key_share else {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::IllegalParameter,
+                PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup,
+            ));
+        };
 
         let key_share = match hrr.key_share {
             Some(group) if group != offered_key_share.group() => {

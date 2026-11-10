@@ -294,6 +294,18 @@ pub struct ClientConfig {
     ///
     /// [RFC 9149]: https://datatracker.ietf.org/doc/html/rfc9149
     pub send_ticket_request: Option<TicketRequest>,
+
+    /// FAIM: the template of another client's hello, to send in place of rustls's own.
+    ///
+    /// The hello goes out as the template has it, with only the random, the session
+    /// id, the key share public keys and the ECH payload made fresh, and the server
+    /// name the connection's own. A server may then answer any extension the template
+    /// offered. When it picks something the fork can't complete, the handshake fails
+    /// with [`Error::Shortfall`]. A connection with a template offers no session to
+    /// resume. `None` (the default) sends rustls's own hello.
+    ///
+    /// [`Error::Shortfall`]: crate::Error::Shortfall
+    pub hello_template: Option<Arc<faim_template::ClientTemplate>>,
 }
 
 /// Desired session ticket counts for the RFC 9149 `ticket_request` extension.
@@ -1075,6 +1087,12 @@ impl std::error::Error for EarlyDataError {}
 pub struct ClientConnectionData {
     pub(super) early_data: EarlyData,
     pub(super) ech_status: EchStatus,
+    /// FAIM: the `application_settings` codepoint the server answered a template's ALPS
+    /// with, so the client sends its own settings before its `Finished`.
+    pub(super) template_alps: Option<u16>,
+    /// FAIM: the extensions a template's hello offered, which the server's certificate
+    /// entries may answer.
+    pub(super) template_offered: Vec<crate::msgs::enums::ExtensionType>,
 }
 
 impl ClientConnectionData {
@@ -1082,6 +1100,8 @@ impl ClientConnectionData {
         Self {
             early_data: EarlyData::new(),
             ech_status: EchStatus::NotOffered,
+            template_alps: None,
+            template_offered: Vec::new(),
         }
     }
 }

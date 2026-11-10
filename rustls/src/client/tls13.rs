@@ -498,6 +498,11 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         self.transcript.add_message(&m);
 
         validate_encrypted_extensions(cx.common, &self.hello, exts)?;
+        // FAIM: what a template's hello asked for that the server agreed to.
+        if self.config.hello_template.is_some() {
+            hs::template::note_encrypted_extensions(cx, exts)?;
+            cx.data.template_offered = self.hello.sent_extensions.clone();
+        }
         hs::process_alpn_protocol(
             cx.common,
             &self.hello.alpn_protocols,
@@ -1003,6 +1008,16 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
             HandshakePayload::CompressedCertificate
         )?;
 
+        // FAIM: a template's algorithm is one it offered, and one the fork has.
+        if let Some(hello_template) = self.config.hello_template.as_deref() {
+            hs::template::check_certificate_compression(
+                cx.common,
+                hello_template,
+                &self.config,
+                compressed_cert.alg,
+            )?;
+        }
+
         let selected_decompressor = self
             .config
             .cert_decompressors
@@ -1119,6 +1134,13 @@ impl State<ClientConnectionData> for ExpectCertificate {
             ));
         }
 
+        // FAIM: an entry's extensions rustls doesn't handle must answer a template's.
+        hs::template::check_certificate_extensions(
+            cx.common,
+            &cx.data.template_offered,
+            cert_chain.unknown_extensions(),
+        )?;
+
         let end_entity_ocsp = cert_chain.end_entity_ocsp().to_vec();
         let server_cert = ServerCertDetails::new(
             cert_chain
@@ -1202,6 +1224,8 @@ impl State<ClientConnectionData> for ExpectCertificateVerify<'_> {
             })?;
 
         // 2. Verify their signature on the handshake.
+        // FAIM: a template's scheme is one it offered, and one the fork can verify.
+        hs::template::check_signature_scheme(cx.common, &self.config, cert_verify.scheme)?;
         let handshake_hash = self.transcript.current_hash();
         let sig_verified = self
             .config
@@ -1384,6 +1408,11 @@ impl State<ClientConnectionData> for ExpectFinished {
         }
 
         let mut flight = HandshakeFlightTls13::new(&mut st.transcript);
+
+        // FAIM: a server that agreed to a template's ALPS gets the client's settings.
+        if let Some(kind) = cx.data.template_alps.take() {
+            hs::template::emit_client_alps(&mut flight, kind);
+        }
 
         /* Send our authentication/finished messages.  These are still encrypted
          * with our handshake keys. */

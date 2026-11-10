@@ -1246,6 +1246,10 @@ extension_struct! {
         /// Encrypted inner client hello response (draft-ietf-tls-esni)
         ExtensionType::EncryptedClientHello =>
             pub(crate) encrypted_client_hello_ack: Option<ServerEncryptedClientHello>,
+
+        /// FAIM: the most a record may carry (RFC 8449), answering a template's offer
+        ExtensionType::RecordSizeLimit =>
+            pub(crate) record_size_limit: Option<u16>,
     } + {
         pub(crate) unknown_extensions: BTreeSet<u16>,
     }
@@ -1271,6 +1275,7 @@ impl ServerExtensions<'_> {
             early_data_ack,
             ticket_request,
             encrypted_client_hello_ack,
+            record_size_limit,
             unknown_extensions,
         } = self;
         ServerExtensions {
@@ -1291,6 +1296,7 @@ impl ServerExtensions<'_> {
             early_data_ack,
             ticket_request,
             encrypted_client_hello_ack,
+            record_size_limit,
             unknown_extensions,
         }
     }
@@ -1729,6 +1735,10 @@ extension_struct! {
     pub(crate) struct CertificateExtensions<'a> {
         ExtensionType::StatusRequest =>
             pub(crate) status: Option<CertificateStatus<'a>>,
+    } + {
+        /// FAIM: the types of the extensions rustls doesn't handle, which the peer's
+        /// state checks against what its hello offered.
+        pub(crate) unknown_extensions: BTreeSet<u16>,
     }
 }
 
@@ -1736,6 +1746,7 @@ impl CertificateExtensions<'_> {
     fn into_owned(self) -> CertificateExtensions<'static> {
         CertificateExtensions {
             status: self.status.map(|s| s.into_owned()),
+            unknown_extensions: self.unknown_extensions,
         }
     }
 }
@@ -1755,12 +1766,14 @@ impl<'a> Codec<'a> for CertificateExtensions<'a> {
         let len = usize::from(u16::read(r)?);
         let mut sub = r.sub(len)?;
 
+        // FAIM: an extension rustls doesn't handle is no longer refused here, but by the
+        // state that reads the certificate, which knows what its hello offered.
+        let mut checker = DuplicateExtensionChecker::new();
         while sub.any_left() {
-            out.read_one(&mut sub, |_unk| {
-                Err(InvalidMessage::UnknownCertificateExtension)
-            })?;
+            out.read_one(&mut sub, |unknown| checker.check(unknown))?;
         }
 
+        out.unknown_extensions = checker.0;
         Ok(out)
     }
 }
@@ -1829,6 +1842,17 @@ impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
 }
 
 impl<'a> CertificatePayloadTls13<'a> {
+    /// FAIM: the types of the extensions rustls doesn't handle, across every entry.
+    pub(crate) fn unknown_extensions(&self) -> impl Iterator<Item = u16> + '_ {
+        self.entries.iter().flat_map(|entry| {
+            entry
+                .extensions
+                .unknown_extensions
+                .iter()
+                .copied()
+        })
+    }
+
     pub(crate) fn new(
         certs: impl Iterator<Item = &'a CertificateDer<'a>>,
         ocsp_response: Option<&'a [u8]>,
