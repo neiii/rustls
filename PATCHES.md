@@ -48,6 +48,14 @@ A change that touches both repositories merges here first. faim-http then pins t
 - **`client/tls12.rs`**: a `ServerKeyExchange`'s curve and signature scheme checked against the template's offer, then against what aws-lc-rs can compute and verify.
 - **`ClientConnectionData`** (`client/client_conn.rs`): `template_alps` and `template_offered`, carried from `EncryptedExtensions` to the states after it.
 
+## The client keeps what the server answered (faim-http#197)
+
+FAIM opens the upstream connection first and answers its client in the shape of what the server sent, so it needs the server's messages, which TLS 1.3 encrypts.
+
+- **`ClientConnection::server_flight`** (`client/client_conn.rs`): the handshake messages the server answered a template's hello with, as `faim_template::ServerFlight` reads them. `None` without a template, so a stock client keeps nothing.
+- **`client/hs/template.rs`**: `KeptFlight` holds them. `keep_server_hello` keeps the `ServerHello` as one TLS record in the version it came in.
+- **`client/hs.rs`, `client/tls13.rs`, `client/tls12.rs`**: each state that reads one of those messages keeps its bytes as they came. A `CompressedCertificate` is kept as the `Certificate` it decompresses to, with its algorithm, built from the decompressed bytes because encoding the parsed payload again would lose the extensions it doesn't name.
+
 ## Messages and errors
 
 - **`Error::Shortfall(faim_template::Shortfall)`** and **`PeerMisbehaved::IllegalRecordSizeLimit`** (`error.rs`).

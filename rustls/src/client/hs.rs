@@ -738,6 +738,10 @@ impl State<ClientConnectionData> for ExpectServerHello {
         let server_hello =
             require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
         trace!("We got ServerHello {server_hello:#?}");
+        // FAIM: kept for `ClientConnection::server_flight`.
+        if self.input.config.hello_template.is_some() {
+            template::keep_server_hello(cx, &m);
+        }
 
         use crate::ProtocolVersion::{TLSv1_2, TLSv1_3};
         let config = &self.input.config;

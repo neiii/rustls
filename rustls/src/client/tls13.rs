@@ -508,6 +508,8 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         if self.config.hello_template.is_some() {
             hs::template::note_encrypted_extensions(cx, exts, &self.config)?;
             cx.data.template_offered = self.hello.sent_extensions.clone();
+            cx.data.template_flight.encrypted_extensions =
+                Some(hs::template::encoded(&m).to_vec());
         }
         hs::process_alpn_protocol(
             cx.common,
@@ -1074,6 +1076,17 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
             compressed_cert.uncompressed_len,
         );
 
+        // FAIM: kept whole for `ClientConnection::server_flight`: encoding the parsed
+        // payload again would lose the extensions it doesn't name.
+        if self.config.hello_template.is_some() {
+            let len = (decompress_buffer.len() as u32).to_be_bytes();
+            let mut message = vec![u8::from(HandshakeType::Certificate), len[1], len[2], len[3]];
+            message.extend_from_slice(&decompress_buffer);
+            cx.data.template_flight.certificate = message;
+            cx.data.template_flight.certificate_compression =
+                Some(faim_template::CertificateCompression(u16::from(compressed_cert.alg)));
+        }
+
         let m = Message {
             version: ProtocolVersion::TLSv1_3,
             payload: MessagePayload::handshake(HandshakeMessagePayload(
@@ -1125,6 +1138,10 @@ impl State<ClientConnectionData> for ExpectCertificate {
     {
         if !self.message_already_in_transcript {
             self.transcript.add_message(&m);
+            // FAIM: kept for `ClientConnection::server_flight`.
+            if self.config.hello_template.is_some() {
+                cx.data.template_flight.certificate = hs::template::encoded(&m).to_vec();
+            }
         }
         let cert_chain = require_handshake_msg_move!(
             m,

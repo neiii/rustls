@@ -49,6 +49,65 @@ const DELEGATED_CREDENTIAL: u16 = 0x0022;
 /// The two `application_settings` codepoints Chromium has sent for ALPS.
 const APPLICATION_SETTINGS: [u16; 2] = [0x4469, 0x44cd];
 
+/// The handshake messages a server answered a template's hello with, kept for
+/// [`ClientConnection::server_flight`].
+///
+/// [`ClientConnection::server_flight`]: crate::client::ClientConnection::server_flight
+#[derive(Debug, Default)]
+pub(in crate::client) struct KeptFlight {
+    pub(in crate::client) server_hello: Vec<u8>,
+    pub(in crate::client) encrypted_extensions: Option<Vec<u8>>,
+    pub(in crate::client) certificate: Vec<u8>,
+    pub(in crate::client) certificate_compression: Option<faim_template::CertificateCompression>,
+    pub(in crate::client) certificate_status: Option<Vec<u8>>,
+    pub(in crate::client) server_key_exchange: Option<Vec<u8>>,
+}
+
+impl KeptFlight {
+    /// The flight as `faim_template` reads it, once it holds a `ServerHello` and a
+    /// `Certificate`: a finished handshake that sent a template's hello always does, as
+    /// the fork offers no session to resume.
+    pub(in crate::client) fn as_flight(&self) -> Option<faim_template::ServerFlight<'_>> {
+        if self.server_hello.is_empty() || self.certificate.is_empty() {
+            return None;
+        }
+        Some(faim_template::ServerFlight {
+            server_hello: &self.server_hello,
+            encrypted_extensions: self.encrypted_extensions.as_deref(),
+            certificate: &self.certificate,
+            certificate_compression: self.certificate_compression,
+            certificate_status: self.certificate_status.as_deref(),
+            server_key_exchange: self.server_key_exchange.as_deref(),
+            new_session_tickets: &[],
+        })
+    }
+}
+
+/// `m`'s bytes as they came, with its four-byte header; empty for a message that isn't
+/// a handshake message, which no caller passes.
+pub(in crate::client) fn encoded<'a>(m: &'a Message<'_>) -> &'a [u8] {
+    match &m.payload {
+        MessagePayload::Handshake { encoded, .. } => encoded.bytes(),
+        _ => &[],
+    }
+}
+
+/// Keeps the `ServerHello` `m` as a TLS record in the version it came in, the form
+/// `faim_template` reads. rustls has joined whatever records carried it. One too long
+/// for a single record is left out, and the flight with it: no server sends one.
+pub(in crate::client) fn keep_server_hello(cx: &mut ClientContext<'_>, m: &Message<'_>) {
+    let message = encoded(m);
+    let Ok(len) = u16::try_from(message.len()) else {
+        return;
+    };
+    let mut record = Vec::with_capacity(message.len() + 5);
+    record.push(u8::from(ContentType::Handshake));
+    record.extend_from_slice(&u16::from(m.version).to_be_bytes());
+    record.extend_from_slice(&len.to_be_bytes());
+    record.extend_from_slice(message);
+    cx.data.template_flight.server_hello = record;
+}
+
 /// A session id as long as `template`'s, of random bytes.
 pub(in crate::client) fn session_id(
     template: &ClientTemplate,

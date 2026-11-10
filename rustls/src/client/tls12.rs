@@ -237,13 +237,17 @@ struct ExpectCertificate {
 impl State<ClientConnectionData> for ExpectCertificate {
     fn handle<'m>(
         mut self: Box<Self>,
-        _cx: &mut ClientContext<'_>,
+        cx: &mut ClientContext<'_>,
         m: Message<'m>,
     ) -> hs::NextStateOrError<'m>
     where
         Self: 'm,
     {
         self.transcript.add_message(&m);
+        // FAIM: kept for `ClientConnection::server_flight`.
+        if self.config.hello_template.is_some() {
+            cx.data.template_flight.certificate = hs::template::encoded(&m).to_vec();
+        }
         let server_cert_chain = require_handshake_msg_move!(
             m,
             HandshakeType::Certificate,
@@ -384,13 +388,17 @@ struct ExpectCertificateStatus<'a> {
 impl State<ClientConnectionData> for ExpectCertificateStatus<'_> {
     fn handle<'m>(
         mut self: Box<Self>,
-        _cx: &mut ClientContext<'_>,
+        cx: &mut ClientContext<'_>,
         m: Message<'m>,
     ) -> hs::NextStateOrError<'m>
     where
         Self: 'm,
     {
         self.transcript.add_message(&m);
+        // FAIM: kept for `ClientConnection::server_flight`.
+        if self.config.hello_template.is_some() {
+            cx.data.template_flight.certificate_status = Some(hs::template::encoded(&m).to_vec());
+        }
         let server_cert_ocsp_response = require_handshake_msg_move!(
             m,
             HandshakeType::CertificateStatus,
@@ -463,6 +471,10 @@ impl State<ClientConnectionData> for ExpectServerKx<'_> {
             HandshakePayload::ServerKeyExchange
         )?;
         self.transcript.add_message(&m);
+        // FAIM: kept for `ClientConnection::server_flight`.
+        if self.config.hello_template.is_some() {
+            cx.data.template_flight.server_key_exchange = Some(hs::template::encoded(&m).to_vec());
+        }
 
         let kx = opaque_kx
             .unwrap_given_kxa(self.suite.kx)
