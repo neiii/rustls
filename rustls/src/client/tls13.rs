@@ -293,7 +293,13 @@ fn validate_server_hello(
     common: &mut CommonState,
     server_hello: &ServerHelloPayload,
 ) -> Result<(), Error> {
-    if !server_hello.only_contains(ALLOWED_PLAINTEXT_EXTS) {
+    // FAIM: `only_contains` sees only the extensions rustls parses. A template offers
+    // others, so one in the cleartext ServerHello is no longer refused as unsolicited.
+    if !server_hello.only_contains(ALLOWED_PLAINTEXT_EXTS)
+        || !server_hello
+            .unknown_extensions
+            .is_empty()
+    {
         return Err(common.send_fatal_alert(
             AlertDescription::UnsupportedExtension,
             PeerMisbehaved::UnexpectedCleartextExtension,

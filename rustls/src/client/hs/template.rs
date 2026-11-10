@@ -450,14 +450,38 @@ pub(in crate::client) fn apply_record_size_limit(
     common.set_max_fragment_size(Some(configured.map_or(limited, |size| size.min(limited))))
 }
 
+/// Refuses a server's answer to an extension the template offered that rustls doesn't
+/// handle, other than those in `handled`. Such an answer can oblige the client to
+/// something the fork doesn't do (an acked `max_fragment_length` caps every record), so
+/// it's a [`Shortfall`] FAIM passes through rather than a connection that breaks later.
+pub(in crate::client) fn check_unhandled_extensions(
+    common: &mut CommonState,
+    exts: &ServerExtensions<'_>,
+    handled: &[u16],
+) -> Result<(), Error> {
+    match exts
+        .unknown_extensions
+        .iter()
+        .find(|kind| !handled.contains(kind))
+    {
+        Some(kind) => Err(common.send_fatal_alert(
+            AlertDescription::UnsupportedExtension,
+            Shortfall::Extension(faim_template::ExtensionType(*kind)),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Notes what a template's hello asked of the client that the server's
 /// `EncryptedExtensions` agreed to: ALPS, to answer before the client's `Finished`, and
-/// a record size limit.
+/// a record size limit. An answer to any other extension rustls doesn't handle is a
+/// shortfall.
 pub(in crate::client) fn note_encrypted_extensions(
     cx: &mut ClientContext<'_>,
     exts: &ServerExtensions<'_>,
     config: &ClientConfig,
 ) -> Result<(), Error> {
+    check_unhandled_extensions(cx.common, exts, &APPLICATION_SETTINGS)?;
     cx.data.template_alps = exts
         .unknown_extensions
         .iter()

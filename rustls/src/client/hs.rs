@@ -818,8 +818,10 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         cx.common.negotiated_version = Some(version);
 
-        // FAIM: a TLS 1.2 server's `record_size_limit` caps what the client sends.
+        // FAIM: a TLS 1.2 server's `record_size_limit` caps what the client sends, and
+        // its answer to another offered extension rustls doesn't handle is a shortfall.
         if version == TLSv1_2 && config.hello_template.is_some() {
+            template::check_unhandled_extensions(cx.common, server_hello, &[])?;
             template::apply_record_size_limit(
                 cx.common,
                 server_hello,
