@@ -459,6 +459,11 @@ pub struct ServerConfig {
     ///
     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
+
+    /// FAIM: the ECH configs to send a client that offered ECH, as an encoded
+    /// `ECHConfigList`, since this server accepts none. A client that greased ECH
+    /// ignores them. `None` (the default) sends none.
+    pub ech_retry_configs: Option<pki_types::EchConfigListBytes<'static>>,
 }
 
 impl ServerConfig {

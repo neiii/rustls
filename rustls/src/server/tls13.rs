@@ -21,8 +21,9 @@ use crate::log::{debug, trace, warn};
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::KeyUpdateRequest;
 use crate::msgs::handshake::{
-    CERTIFICATE_MAX_SIZE_LIMIT, CertificateChain, CertificatePayloadTls13, HandshakeMessagePayload,
-    HandshakePayload, NewSessionTicketPayloadTls13,
+    CERTIFICATE_MAX_SIZE_LIMIT, CertificateChain, CertificatePayloadTls13, EchConfigPayload,
+    HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayloadTls13,
+    ServerEncryptedClientHello,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
@@ -739,6 +740,15 @@ mod client_hello {
         let early_data = decide_if_early_data_allowed(cx, hello, resuming, suite, config);
         if early_data == EarlyDataDecision::Accepted {
             ep.extensions.early_data_ack = Some(());
+        }
+
+        // FAIM: retry configs for a client that offered ECH, which this server never
+        // accepts (RFC 9849 §7.1).
+        if let (Some(configs), Some(_)) = (&config.ech_retry_configs, &hello.encrypted_client_hello)
+        {
+            let retry_configs = Vec::<EchConfigPayload>::read(&mut Reader::init(configs))?;
+            ep.extensions.encrypted_client_hello_ack =
+                Some(ServerEncryptedClientHello { retry_configs });
         }
 
         let ee = HandshakeMessagePayload(HandshakePayload::EncryptedExtensions(ep.extensions));
