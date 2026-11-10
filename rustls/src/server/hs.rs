@@ -401,7 +401,13 @@ impl ExpectClientHello {
         };
         let mut version = version;
         if let Some(fitted) = &answer {
-            match template::version(fitted, version, tls12_enabled && !cx.common.is_quic(), cx) {
+            match template::version(
+                fitted,
+                &self.config,
+                version,
+                tls12_enabled && !cx.common.is_quic(),
+                cx,
+            ) {
                 Some(wanted) => version = wanted,
                 None => answer = None,
             }
@@ -486,28 +492,22 @@ impl ExpectClientHello {
             })?;
 
         // FAIM: the server template's suite and group, where the fork completes them.
-        let picked = answer.as_ref().map(|fitted| {
-            template::suite_and_group(
-                fitted,
-                &self.config,
-                version,
-                certkey.get_key().algorithm(),
-                cx.common.protocol,
-                (suite, skxg),
-                cx,
-            )
-        });
-        let (suite, skxg) = match picked {
-            Some(Some(picked)) => picked,
-            Some(None) => {
-                answer = None;
-                (suite, skxg)
+        let (suite, skxg) = match &mut answer {
+            Some(fitted) => {
+                let picked = template::suite_and_group(
+                    fitted,
+                    &self.config,
+                    version,
+                    certkey.get_key().algorithm(),
+                    cx.common.protocol,
+                    (suite, skxg),
+                    cx,
+                );
+                template::adopt(fitted, cx);
+                picked
             }
             None => (suite, skxg),
         };
-        if let Some(fitted) = &mut answer {
-            template::adopt(fitted, cx);
-        }
 
         // RFC 9846 section 4.2.4: the server must negotiate the same cipher suite it
         // named in its HelloRetryRequest

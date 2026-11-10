@@ -74,9 +74,13 @@ pub(super) fn adopt(answer: &mut Answer, cx: &mut ServerContext<'_>) {
 
 /// The version to answer in: the template's, where `stock` (what rustls would pick)
 /// differs and `tls12_enabled` allows it. `None` when the template's version can't be
-/// answered in, which drops the template.
+/// answered in, or the fork can't complete its group, either of which drops the
+/// template before rustls's version is replaced: a TLS 1.2 answer the fork then
+/// couldn't send would leave a client offering TLS 1.3 a stock TLS 1.2 answer with
+/// rustls's downgrade marker, which it refuses.
 pub(super) fn version(
     answer: &Answer,
+    config: &ServerConfig,
     stock: ProtocolVersion,
     tls12_enabled: bool,
     cx: &mut ServerContext<'_>,
@@ -87,19 +91,40 @@ pub(super) fn version(
         ProtocolVersion::TLSv1_2 => tls12_enabled,
         _ => false,
     };
-    if possible {
-        Some(wanted)
-    } else {
+    if !possible {
         cx.data
             .template_shortfalls
             .push(ServerShortfall::Version(answer.version));
-        None
+        return None;
     }
+    if let Some(group) = answer.group {
+        if group_for(config, wanted, group).is_none() {
+            cx.data
+                .template_shortfalls
+                .push(ServerShortfall::Group(group));
+            return None;
+        }
+    }
+    Some(wanted)
+}
+
+/// The provider's key exchange for `group` on `version`.
+fn group_for(
+    config: &ServerConfig,
+    version: ProtocolVersion,
+    group: faim_template::NamedGroup,
+) -> Option<&'static dyn SupportedKxGroup> {
+    config
+        .provider
+        .kx_groups
+        .iter()
+        .find(|kxg| kxg.usable_for_version(version) && u16::from(kxg.name()) == group.0)
+        .copied()
 }
 
 /// The suite and group to answer with: the template's, where the fork's provider
-/// completes them, else rustls's own `stock` picks. `None` when the fork can't complete
-/// the template's group, which drops the template: its `ServerHello` names it.
+/// completes them, else rustls's own `stock` picks. [`version`] has already dropped a
+/// template whose group the fork can't complete.
 pub(super) fn suite_and_group(
     answer: &Answer,
     config: &ServerConfig,
@@ -108,27 +133,12 @@ pub(super) fn suite_and_group(
     protocol: Protocol,
     stock: (SupportedCipherSuite, &'static dyn SupportedKxGroup),
     cx: &mut ServerContext<'_>,
-) -> Option<(SupportedCipherSuite, &'static dyn SupportedKxGroup)> {
+) -> (SupportedCipherSuite, &'static dyn SupportedKxGroup) {
     let (stock_suite, stock_group) = stock;
-    let group = match answer.group {
-        Some(group) => {
-            let found = config
-                .provider
-                .kx_groups
-                .iter()
-                .find(|kxg| kxg.usable_for_version(version) && u16::from(kxg.name()) == group.0);
-            match found {
-                Some(kxg) => *kxg,
-                None => {
-                    cx.data
-                        .template_shortfalls
-                        .push(ServerShortfall::Group(group));
-                    return None;
-                }
-            }
-        }
-        None => stock_group,
-    };
+    let group = answer
+        .group
+        .and_then(|group| group_for(config, version, group))
+        .unwrap_or(stock_group);
     let suite = match answer.cipher_suite {
         Some(suite) => {
             let found = config
@@ -154,7 +164,7 @@ pub(super) fn suite_and_group(
         }
         None => stock_suite,
     };
-    Some((suite, group))
+    (suite, group)
 }
 
 /// The `ServerHello` handshake message the template renders with this connection's
