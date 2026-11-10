@@ -74,11 +74,12 @@ FAIM answers its client in the shape of the answer the real server gave (its ADR
   - The server random ends with the template's downgrade marker where the server's did, and rustls's own marker is left off.
 - **`server/tls13.rs`**:
   - `ServerHello`: the template's, rendered with the connection's random, the client's session id, the suite and the key share, and sent as rendered (`HandshakePayload::Unknown`), so its extensions keep the server's order.
-  - `EncryptedExtensions`: the template's, rendered and sent as rendered. Its ALPN protocol becomes the connection's; a `record_size_limit` or `max_fragment_length` it agrees to caps what the server sends; early data is never accepted, since nothing here resumes.
+  - `EncryptedExtensions`: the template's, rendered and sent as rendered. Its ALPN protocol becomes the connection's; a `record_size_limit` or `max_fragment_length` it agrees to caps what the server sends, below a smaller `ServerConfig::max_fragment_size`, which stays; early data is never accepted.
+  - No PSK is accepted: the template's `ServerHello` names none until faim-http#199 mirrors resumption, so a client offering one gets a full handshake.
   - `Certificate`: compressed with the template's algorithm where the server compressed its own and the config has a compressor for it, uncompressed otherwise; an OCSP response stapled only where the template's answer staples one, and a shortfall where it does and the certified key has none.
-  - `ExpectFinished`: a client that agreed to the template's ALPS sends its own `EncryptedExtensions` before its `Finished`, as Chromium does; it goes into the transcript.
+  - `ExpectFinished`, `ExpectCertificate` and `ExpectCertificateOrCompressedCertificate`: a client that agreed to the template's ALPS sends its own `EncryptedExtensions` first, before its certificate when asked for one and otherwise before its `Finished`, as Chromium does; it goes into the transcript.
 - **`server/tls12.rs`**:
-  - `ServerHello`: the template's, rendered with the connection's random, an empty session id (no resumption until faim-http#199) and the suite, and sent as rendered. No ticket is issued. ALPN and record size limits apply as on TLS 1.3.
+  - `ServerHello`: the template's, rendered with the connection's random, an empty session id and the suite, and sent as rendered. No ticket is issued, and a ticket or session id the client offers isn't resumed, since a resumed handshake would send rustls's own `ServerHello` (faim-http#199). ALPN and record size limits apply as on TLS 1.3.
   - Extended master secret only where the template's answer agreed to it.
   - `ServerKeyExchange`: signed with the template's scheme where the client offered it and the key signs with it, else rustls's pick and a shortfall.
   - `CertificateStatus`: sent where the template's answer staples, as on TLS 1.3; where the key has no response, `status_request` is left out of the `ServerHello` too.
