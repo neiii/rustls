@@ -56,5 +56,5 @@ A change that touches both repositories merges here first. faim-http then pins t
 
 ## The server
 
-- **`ServerConfig::ech_retry_configs`** (`server/server_conn.rs`, default `None` in `server/builder.rs`; sent from `server/tls13.rs`): ECH configs to send a client that offered ECH, since the server accepts none (RFC 9849 §7.1). Configs that don't parse are left out with a warning rather than failing the handshake after `ServerHello`. FAIM's test harness uses it to show that a greased ECH ignores them (faim-http#200), and faim-http#196 mirrors a server's own.
+- **`ServerConfig::ech_retry_configs`** (`server/server_conn.rs`, default `None` in `server/builder.rs`; sent from `server/tls13.rs`): ECH configs to send a client that offered ECH, since the server accepts none (RFC 9849 §7.1). Configs that don't parse, or parse to an empty list the extension doesn't allow, are left out with a warning rather than failing the handshake after `ServerHello` or sending an invalid extension. FAIM's test harness uses it to show that a greased ECH ignores them (faim-http#200), and faim-http#196 mirrors a server's own.
 - **`server/tls13.rs`**: a client certificate entry with an extension rustls doesn't handle is refused here, where decoding used to refuse it (see `CertificateExtensions` above).

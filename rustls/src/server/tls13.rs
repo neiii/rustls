@@ -743,16 +743,17 @@ mod client_hello {
         }
 
         // FAIM: retry configs for a client that offered ECH, which this server never
-        // accepts (RFC 9849 §7.1). Configs that don't parse are left out: ServerHello
-        // has gone out, and the client is answered the same way without them.
+        // accepts (RFC 9849 §7.1). Configs that don't parse, or parse to an empty list
+        // the extension doesn't allow, are left out: ServerHello has gone out, and the
+        // client is answered the same way without them.
         if let (Some(configs), Some(_)) = (&config.ech_retry_configs, &hello.encrypted_client_hello)
         {
             match Vec::<EchConfigPayload>::read(&mut Reader::init(configs)) {
-                Ok(retry_configs) => {
+                Ok(retry_configs) if !retry_configs.is_empty() => {
                     ep.extensions.encrypted_client_hello_ack =
                         Some(ServerEncryptedClientHello { retry_configs });
                 }
-                Err(err) => warn!("not sending ech_retry_configs that don't parse: {err:?}"),
+                _ => warn!("not sending ech_retry_configs that are empty or don't parse"),
             }
         }
 
