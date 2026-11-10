@@ -629,6 +629,8 @@ pub mod server {
     pub(crate) mod handy;
     mod hs;
     mod server_conn;
+    // FAIM: answering from a server template (faim-http#196).
+    mod template;
     #[cfg(test)]
     mod test;
     #[cfg(feature = "tls12")]
