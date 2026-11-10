@@ -285,7 +285,13 @@ mod client_hello {
             let mut chosen_psk_index = None;
             let mut resumedata = None;
 
-            if let Some(psk_offer) = &client_hello.preshared_key_offer {
+            // FAIM: a server template answers in full, since its ServerHello names no PSK
+            // until faim-http#199 mirrors resumption.
+            if let Some(psk_offer) = client_hello
+                .preshared_key_offer
+                .as_ref()
+                .filter(|_| self.answer.is_none())
+            {
                 // "A client MUST provide a "psk_key_exchange_modes" extension if it
                 //  offers a "pre_shared_key" extension. If clients offer
                 //  "pre_shared_key" without a "psk_key_exchange_modes" extension,
@@ -754,7 +760,11 @@ mod client_hello {
         // FAIM: the server template's `EncryptedExtensions`, as it renders. Nothing here
         // resumes, so early data is never accepted.
         if let Some(answer) = answer {
-            flight.add(template::encrypted_extensions(answer, cx)?);
+            flight.add(template::encrypted_extensions(
+                answer,
+                cx,
+                config.max_fragment_size,
+            )?);
             return Ok(decide_if_early_data_allowed(cx, hello, None, suite, config));
         }
 
@@ -978,13 +988,20 @@ struct ExpectCertificateOrCompressedCertificate {
 
 impl State<ServerConnectionData> for ExpectCertificateOrCompressedCertificate {
     fn handle<'m>(
-        self: Box<Self>,
+        mut self: Box<Self>,
         cx: &mut ServerContext<'_>,
         m: Message<'m>,
     ) -> hs::NextStateOrError<'m>
     where
         Self: 'm,
     {
+        // FAIM: a client that agreed to the server template's ALPS sends its own
+        // `EncryptedExtensions` before its certificate.
+        if cx.data.template_alps.is_some() {
+            template::read_client_encrypted_extensions(cx, &m, &mut self.transcript)?;
+            return Ok(self);
+        }
+
         match m.payload {
             MessagePayload::Handshake {
                 parsed: HandshakeMessagePayload(HandshakePayload::CertificateTls13(..)),
@@ -1142,6 +1159,13 @@ impl State<ServerConnectionData> for ExpectCertificate {
     where
         Self: 'm,
     {
+        // FAIM: a client that agreed to the server template's ALPS sends its own
+        // `EncryptedExtensions` before its certificate.
+        if cx.data.template_alps.is_some() {
+            template::read_client_encrypted_extensions(cx, &m, &mut self.transcript)?;
+            return Ok(self);
+        }
+
         if !self.message_already_in_transcript {
             self.transcript.add_message(&m);
         }

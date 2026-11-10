@@ -162,7 +162,15 @@ mod client_hello {
                 })
                 .and_then(|x| persist::ServerSessionValue::read_bytes(&x).ok())
                 .filter(|resumedata| {
-                    hs::can_resume(self.suite.into(), &cx.data.sni, self.using_ems, resumedata)
+                    // FAIM: a server template answers in full, since resuming would send
+                    // rustls's own ServerHello (faim-http#199 mirrors resumption).
+                    self.answer.is_none()
+                        && hs::can_resume(
+                            self.suite.into(),
+                            &cx.data.sni,
+                            self.using_ems,
+                            resumedata,
+                        )
                 });
 
             if let Some(data) = resume_data {
@@ -358,7 +366,12 @@ mod client_hello {
     ) -> Result<bool, Error> {
         // FAIM: the server template's `ServerHello`, as it renders. It issues no ticket.
         if let Some(answer) = answer {
-            template::agree(answer, cx, ProtocolVersion::TLSv1_2)?;
+            template::agree(
+                answer,
+                cx,
+                ProtocolVersion::TLSv1_2,
+                config.max_fragment_size,
+            )?;
             flight.add(template::server_hello(
                 answer,
                 randoms.server,

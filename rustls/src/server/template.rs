@@ -201,8 +201,9 @@ pub(super) fn record_version(answer: &Answer) -> ProtocolVersion {
 pub(super) fn encrypted_extensions(
     answer: &Answer,
     cx: &mut ServerContext<'_>,
+    configured: Option<usize>,
 ) -> Result<HandshakeMessagePayload<'static>, Error> {
-    agree(answer, cx, ProtocolVersion::TLSv1_3)?;
+    agree(answer, cx, ProtocolVersion::TLSv1_3, configured)?;
     cx.data.template_alps = answer.alps.map(|kind| kind.0);
     let rendered = answer
         .render_encrypted_extensions()
@@ -211,26 +212,30 @@ pub(super) fn encrypted_extensions(
 }
 
 /// Applies what the template's answer agrees to on a connection of `version`: the
-/// protocol ALPN picked, and the record size the client asked for.
+/// protocol ALPN picked, and the record size the client asked for, keeping a
+/// `configured` `ServerConfig::max_fragment_size` that is smaller.
 pub(super) fn agree(
     answer: &Answer,
     cx: &mut ServerContext<'_>,
     version: ProtocolVersion,
+    configured: Option<usize>,
 ) -> Result<(), Error> {
     cx.common.alpn_protocol = answer
         .alpn
         .clone()
         .map(ProtocolName::from);
-    cap_records(cx.common, answer, version)
+    cap_records(cx.common, answer, version, configured)
 }
 
 /// Caps what the server sends at what the template's answer agreed to: the client's
 /// `record_size_limit` (RFC 8449), which on TLS 1.3 counts the content type byte, and
-/// a `max_fragment_length` (RFC 6066 §4).
+/// a `max_fragment_length` (RFC 6066 §4). A `configured` fragment size below the cap
+/// stays, as the client side keeps it.
 fn cap_records(
     common: &mut CommonState,
     answer: &Answer,
     version: ProtocolVersion,
+    configured: Option<usize>,
 ) -> Result<(), Error> {
     let mut plaintext = MAX_FRAGMENT_LEN;
     if let Some(limit) = answer.record_size_limit {
@@ -251,7 +256,8 @@ fn cap_records(
     if plaintext == MAX_FRAGMENT_LEN {
         return Ok(());
     }
-    common.set_max_fragment_size(Some(plaintext + PACKET_OVERHEAD))
+    let capped = plaintext + PACKET_OVERHEAD;
+    common.set_max_fragment_size(Some(configured.map_or(capped, |size| size.min(capped))))
 }
 
 /// Keeps `ocsp` only where the template's answer staples one, recording a shortfall
