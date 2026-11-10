@@ -106,3 +106,6 @@ lto = true
 # against the latest _published_ copy.
 [patch.crates-io]
 rustls = { path = "rustls" }
+# FAIM: faim-template, which crates.io doesn't have, from a faim-http checkout beside this
+# one (PATCHES.md). A crate that depends on this fork supplies its own.
+faim-template = { path = "../faim-http/crates/faim-template" }
