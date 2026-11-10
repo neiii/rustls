@@ -37,8 +37,9 @@ jobs:
         with:
           path: rustls
           persist-credentials: false
-      # FAIM_HTTP_REF names the faim-http ref whose faim-template this commit builds with,
-      # so a pull request that needs an unmerged faim-http change can name its branch.
+      # FAIM_HTTP_REF names the faim-http commit whose faim-template this commit builds
+      # with: a commit, not a branch, so a run is reproducible, and one not yet on master
+      # when a change here needs an unmerged faim-template change.
       - name: Read the faim-http ref
         id: faim-http
         env:
@@ -67,6 +68,15 @@ jobs:
         with:
           go-version: "1.27.2"
           cache: false
+      # Upstream's feature matrix, which its removed workflows built: the fork must still
+      # compile without std and with either provider, though FAIM builds only one.
+      - name: Feature builds
+        working-directory: rustls
+        run: |
+          cargo check -p rustls --no-default-features
+          cargo check -p rustls --no-default-features --features aws_lc_rs
+          cargo check -p rustls --no-default-features --features ring,std
+          cargo check -p rustls --no-default-features --features aws_lc_rs,std,tls12
       - name: rustls's tests
         working-directory: rustls
         run: cargo test -p rustls

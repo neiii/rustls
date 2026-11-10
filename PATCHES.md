@@ -13,7 +13,7 @@ The fork's `rustls` crate depends on `faim-template = "0.1"`, which crates.io do
 - rustls's own tests: `cargo test -p rustls`.
 - BoGo: `cd bogo && BOGO_SHIM_PROVIDER=aws-lc-rs ./runme`, with Go installed.
 
-The `faim` workflow (`.github/workflows/faim.yml`) runs both on every push and pull request to this branch. faim-http is private, so the workflow checks it out with the `FAIM_HTTP_TOKEN` secret, a fine-grained token with Contents: read on `neiii/faim-http`. It builds against the faim-http ref named in `FAIM_HTTP_REF`, a one-line file at the root: `master` normally, or a faim-http branch while a change here needs a faim-template change faim-http hasn't merged yet. Set it back to `master` once that branch merges. A run started by hand can name another ref with `faim-http-ref`.
+The `faim` workflow (`.github/workflows/faim.yml`) runs both on every push and pull request to this branch, after checking that the `rustls` crate still compiles across upstream's feature builds (no std, either provider). faim-http is private, so the workflow checks it out with the `FAIM_HTTP_TOKEN` secret, a fine-grained token with Contents: read on `neiii/faim-http`. It builds against the faim-http commit named in `FAIM_HTTP_REF`, a one-line file at the root. A commit, not a branch, so a green run says what it was built against. A change here that needs a faim-template change faim-http hasn't merged names the faim-http commit that has it; otherwise the file names a commit on faim-http's `master`. A run started by hand can name another ref with `faim-http-ref`.
 
 A change that touches both repositories merges here first. faim-http then pins the new commit.
 
@@ -22,8 +22,8 @@ A change that touches both repositories merges here first. faim-http then pins t
 - **`Cargo.toml`**: `[patch.crates-io]` supplies `faim-template` from `../faim-http` (see above).
 - **`Cargo.lock`**: `aws-lc-rs` 1.19.0 and `aws-lc-sys` 0.47.0, the versions FAIM builds with, so the fork's tests run on the crypto FAIM ships, and `faim-template` with its dependencies. A change that bumps `aws-lc-rs` in faim-http's `Cargo.lock` bumps it here too (`cargo update -p aws-lc-rs --precise <version>`).
 - **`rustls/Cargo.toml`**: depends on `faim-template = "0.1"`.
-- **`FAIM_HTTP_REF`** (new): the faim-http ref the `faim` workflow builds faim-template from (see above).
-- **`.github/workflows/`**: upstream's workflows are removed. They build without faim-template, so every one would fail here, and FAIM doesn't need their release, fuzzing or docs jobs. `faim.yml` replaces them.
+- **`FAIM_HTTP_REF`** (new): the faim-http commit the `faim` workflow builds faim-template from (see above).
+- **`.github/workflows/`**: upstream's workflows are removed. They build without faim-template, so every one would fail here, and FAIM doesn't need their release or docs jobs. `faim.yml` replaces them, and keeps their feature builds. Their fuzzing and dependency checks aren't replaced here: faim-http's `mise run check` audits the dependency tree it builds this fork into, and fuzzing the template path needs faim-http's corpus.
 
 ## The client sends a template's hello
 
@@ -39,7 +39,8 @@ A change that touches both repositories merges here first. faim-http then pins t
   - A template that offered no TLS 1.3 takes a TLS 1.2 `ServerHello` whose random carries the downgrade marker, which every TLS 1.3 server sets when it answers TLS 1.2.
   - A TLS 1.2 server's `record_size_limit` caps what the client sends. A smaller `ClientConfig::max_fragment_size` stays (here and in TLS 1.3).
 - **`client/tls13.rs`**:
-  - `EncryptedExtensions`: notes ALPS (`application_settings`, 0x4469 or 0x44cd) and applies `record_size_limit`, and keeps what the template offered for the certificate's entries to answer.
+  - `EncryptedExtensions`: notes ALPS (`application_settings`, 0x4469 or 0x44cd) and applies `record_size_limit`, and keeps what the template offered for the certificate's entries to answer. An answer to any other offered extension rustls doesn't handle is `Shortfall::Extension` (`template::check_unhandled_extensions`), since it can oblige the client to something the fork doesn't do: an acked `max_fragment_length` caps every record. The same goes for a TLS 1.2 `ServerHello`.
+  - A TLS 1.3 `ServerHello` carrying an extension rustls doesn't parse is refused as `UnexpectedCleartextExtension` (`validate_server_hello`), as stock rustls refuses it as unsolicited. `only_contains` sees only the extensions rustls parses, and a template offers others.
   - `Certificate`: an entry's extension rustls doesn't handle must answer one the template offered, and a delegated credential is a `Shortfall`, since the handshake is then signed with the credential's key.
   - `CompressedCertificate`: the algorithm checked against the template's offer, then against the fork's decompressors.
   - `CertificateVerify`: the scheme checked against the template's `signature_algorithms`, then against what the verifier can check.
