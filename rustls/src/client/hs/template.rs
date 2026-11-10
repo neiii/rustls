@@ -102,7 +102,15 @@ pub(super) fn emit_client_hello(
 
     let mut fresh = Fresh::new(input.random.0, input.session_id.as_ref().to_vec());
     fresh.server_name = match &input.server_name {
-        ServerName::DnsName(name) if config.enable_sni => Some(name.as_ref().to_string()),
+        // RFC 6066: no trailing dot, as stock rustls's `ServerNamePayload` sends it.
+        ServerName::DnsName(name) if config.enable_sni => {
+            let name = name.as_ref();
+            Some(
+                name.strip_suffix('.')
+                    .unwrap_or(name)
+                    .to_string(),
+            )
+        }
         _ => None,
     };
 
@@ -417,11 +425,13 @@ pub(in crate::client) fn check_certificate_compression(
 
 /// Caps what the client sends at the `record_size_limit` (RFC 8449) the server
 /// answered with in `exts`, on a connection of `version`. TLS 1.3 counts the content
-/// type byte in the limit.
+/// type byte in the limit. A `configured` `ClientConfig::max_fragment_size` below the
+/// limit stays.
 pub(in crate::client) fn apply_record_size_limit(
     common: &mut CommonState,
     exts: &ServerExtensions<'_>,
     version: ProtocolVersion,
+    configured: Option<usize>,
 ) -> Result<(), Error> {
     let Some(limit) = exts.record_size_limit else {
         return Ok(());
@@ -436,7 +446,8 @@ pub(in crate::client) fn apply_record_size_limit(
         ProtocolVersion::TLSv1_3 => usize::from(limit) - 1,
         _ => usize::from(limit),
     };
-    common.set_max_fragment_size(Some(plaintext.min(MAX_FRAGMENT_LEN) + PACKET_OVERHEAD))
+    let limited = plaintext.min(MAX_FRAGMENT_LEN) + PACKET_OVERHEAD;
+    common.set_max_fragment_size(Some(configured.map_or(limited, |size| size.min(limited))))
 }
 
 /// Notes what a template's hello asked of the client that the server's
@@ -445,13 +456,19 @@ pub(in crate::client) fn apply_record_size_limit(
 pub(in crate::client) fn note_encrypted_extensions(
     cx: &mut ClientContext<'_>,
     exts: &ServerExtensions<'_>,
+    config: &ClientConfig,
 ) -> Result<(), Error> {
     cx.data.template_alps = exts
         .unknown_extensions
         .iter()
         .copied()
         .find(|kind| APPLICATION_SETTINGS.contains(kind));
-    apply_record_size_limit(cx.common, exts, ProtocolVersion::TLSv1_3)
+    apply_record_size_limit(
+        cx.common,
+        exts,
+        ProtocolVersion::TLSv1_3,
+        config.max_fragment_size,
+    )
 }
 
 /// Sends the client's `EncryptedExtensions` with an `application_settings` of type
@@ -520,5 +537,54 @@ fn random_bytes(secure_random: &dyn SecureRandom, len: usize) -> Result<Vec<u8>,
 impl From<Shortfall> for Error {
     fn from(shortfall: Shortfall) -> Self {
         Self::Shortfall(shortfall)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common_state::Side;
+
+    /// The largest plaintext record a client sends once a server answered with
+    /// `limit`, when `ClientConfig::max_fragment_size` is `configured`.
+    fn largest_record(configured: Option<usize>, limit: u16) -> usize {
+        let mut common = CommonState::new(Side::Client);
+        common
+            .set_max_fragment_size(configured)
+            .unwrap();
+        let exts = ServerExtensions {
+            record_size_limit: Some(limit),
+            ..ServerExtensions::default()
+        };
+        apply_record_size_limit(&mut common, &exts, ProtocolVersion::TLSv1_3, configured).unwrap();
+        let message = Message {
+            version: ProtocolVersion::TLSv1_3,
+            payload: MessagePayload::ApplicationData(Payload::new(vec![0; 20_000])),
+        };
+        common.send_msg(message, false);
+        let mut records = Vec::new();
+        common
+            .sendable_tls
+            .write_to(&mut records)
+            .unwrap();
+        let mut largest = 0;
+        let mut rest = &records[..];
+        while let [_, _, _, high, low, tail @ ..] = rest {
+            let len = usize::from(u16::from_be_bytes([*high, *low]));
+            largest = largest.max(len);
+            rest = &tail[len..];
+        }
+        largest
+    }
+
+    #[test]
+    fn a_record_size_limit_caps_the_records_the_client_sends() {
+        // TLS 1.3 counts the content type byte in the limit.
+        assert_eq!(largest_record(None, 1025), 1024);
+    }
+
+    #[test]
+    fn a_record_size_limit_never_raises_a_configured_fragment_size() {
+        assert_eq!(largest_record(Some(517), 16385), 512);
     }
 }

@@ -174,8 +174,14 @@ impl ClientHelloInput {
             transcript_buffer.set_client_auth_enabled();
         }
 
-        // FAIM: a template's hello makes its own key shares.
+        // FAIM: a template's hello makes its own key shares. It greases ECH in its
+        // client's shape, so a config that asks for real ECH would silently lose it.
         if let Some(hello_template) = self.config.hello_template.clone() {
+            if let Some(EchMode::Enable(_)) = &self.config.ech_mode {
+                return Err(Error::General(
+                    "a hello template can't send real ECH (ClientConfig::hello_template)".into(),
+                ));
+            }
             return template::emit_client_hello(
                 hello_template,
                 transcript_buffer,
@@ -808,7 +814,12 @@ impl State<ClientConnectionData> for ExpectServerHello {
 
         // FAIM: a TLS 1.2 server's `record_size_limit` caps what the client sends.
         if version == TLSv1_2 && config.hello_template.is_some() {
-            template::apply_record_size_limit(cx.common, server_hello, version)?;
+            template::apply_record_size_limit(
+                cx.common,
+                server_hello,
+                version,
+                config.max_fragment_size,
+            )?;
         }
 
         // Extract ALPN protocol

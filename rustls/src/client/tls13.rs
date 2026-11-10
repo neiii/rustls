@@ -500,7 +500,7 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         validate_encrypted_extensions(cx.common, &self.hello, exts)?;
         // FAIM: what a template's hello asked for that the server agreed to.
         if self.config.hello_template.is_some() {
-            hs::template::note_encrypted_extensions(cx, exts)?;
+            hs::template::note_encrypted_extensions(cx, exts, &self.config)?;
             cx.data.template_offered = self.hello.sent_extensions.clone();
         }
         hs::process_alpn_protocol(
