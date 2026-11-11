@@ -502,17 +502,6 @@ impl CommonState {
 
     /// Send any buffered plaintext.  Plaintext is buffered if
     /// written during handshake.
-    /// FAIM: sends what of `plaintext` the held early data window still takes, as early
-    /// data. Returns how many bytes it took.
-    pub(crate) fn send_held_early_data(&mut self, plaintext: &[u8]) -> usize {
-        let Some(left) = self.early_data_held else {
-            return 0;
-        };
-        let taken = self.send_early_plaintext(&plaintext[..left.min(plaintext.len())]);
-        self.early_data_held = Some(left - taken);
-        taken
-    }
-
     fn flush_plaintext(&mut self, sendable_plaintext: &mut ChunkVecBuffer) {
         if !self.may_send_application_data {
             return;
@@ -841,6 +830,17 @@ impl CommonState {
             };
         }
         self.send_plain(payload, Limit::Yes, sendable_plaintext)
+    }
+
+    /// FAIM: sends what of `plaintext` the held early data window still takes, as early
+    /// data. Returns how many bytes it took.
+    fn send_held_early_data(&mut self, plaintext: &[u8]) -> usize {
+        let Some(left) = self.early_data_held else {
+            return 0;
+        };
+        let taken = self.send_early_plaintext(&plaintext[..left.min(plaintext.len())]);
+        self.early_data_held = Some(left - taken);
+        taken
     }
 
     pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {

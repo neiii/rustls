@@ -293,7 +293,7 @@ mod client_hello {
                 .filter(|_| {
                     self.answer
                         .as_ref()
-                        .is_none_or(|answer| answer.resumed)
+                        .is_none_or(|answer| answer.resumption.resumed())
                 })
             {
                 // "A client MUST provide a "psk_key_exchange_modes" extension if it
@@ -400,7 +400,7 @@ mod client_hello {
                 && self
                     .answer
                     .as_ref()
-                    .is_some_and(|answer| answer.resumed)
+                    .is_some_and(|answer| answer.resumption.resumed())
             {
                 cx.data
                     .template_shortfalls
@@ -783,7 +783,7 @@ mod client_hello {
                 config.max_fragment_size,
             )?;
             let decision = decide_if_early_data_allowed(cx, hello, resuming, suite, config);
-            let accepted = answer.early_data && decision == EarlyDataDecision::Accepted;
+            let accepted = answer.resumption.early_data() && decision == EarlyDataDecision::Accepted;
             let without_early_data;
             let sent = match accepted {
                 true => answer,

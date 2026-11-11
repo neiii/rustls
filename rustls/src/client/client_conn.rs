@@ -614,6 +614,11 @@ pub(super) struct EarlyData {
 }
 
 impl EarlyData {
+    /// How much more early data may be written.
+    pub(super) fn bytes_left(&self) -> usize {
+        self.left
+    }
+
     fn new() -> Self {
         Self {
             left: 0,
@@ -730,10 +735,6 @@ mod connection {
         fn check_write(&mut self, sz: usize) -> io::Result<usize> {
             self.check_write_opt(sz)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
-        }
-
-        pub(crate) fn bytes_left(&self) -> usize {
-            self.left
         }
     }
 
