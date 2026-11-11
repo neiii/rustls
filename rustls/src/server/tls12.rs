@@ -378,6 +378,7 @@ mod client_hello {
                 session_id.as_ref(),
                 suite.common.suite,
                 None,
+                None,
             )?);
             return Ok(false);
         }

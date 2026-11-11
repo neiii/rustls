@@ -721,6 +721,24 @@ mod connection {
             self.inner.core.data.resumption_data = data.into();
         }
 
+        /// FAIM: issues the client one TLS 1.3 session ticket with this `lifetime` hint,
+        /// after the handshake, promising `max_early_data` bytes of early data. faim-http
+        /// mirrors each ticket the real server issues (faim-http#199); it goes through
+        /// `ServerConfig::session_storage`, and `ServerConfig::ticketer` must be off.
+        ///
+        /// # Errors
+        ///
+        /// When the handshake hasn't completed, or the connection isn't TLS 1.3.
+        pub fn issue_tls13_ticket(
+            &mut self,
+            lifetime: u32,
+            max_early_data: u32,
+        ) -> Result<(), Error> {
+            self.inner
+                .core
+                .issue_tls13_ticket(lifetime, max_early_data)
+        }
+
         /// FAIM: what of `ServerConfig::hello_template` this connection couldn't send its
         /// client, in the order met (faim-http#196). Empty without a template, and
         /// complete once the handshake is.

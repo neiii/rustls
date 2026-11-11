@@ -578,6 +578,12 @@ impl<Data> ConnectionCommon<Data> {
 
 #[cfg(feature = "std")]
 impl<Data> ConnectionCommon<Data> {
+    /// FAIM: ends the early data this connection holds open (`ClientConfig::hold_early_data`).
+    pub(crate) fn end_early_data(&mut self) -> Result<(), Error> {
+        self.core
+            .end_early_data(&mut self.sendable_plaintext)
+    }
+
     /// Returns an object that allows reading plaintext.
     pub fn reader(&mut self) -> Reader<'_> {
         let common = &mut self.core.common_state;
@@ -1297,6 +1303,52 @@ impl<Data> ConnectionCore<Data> {
         match &mut self.state {
             Ok(st) => st.send_key_update_request(&mut self.common_state),
             Err(e) => Err(e.clone()),
+        }
+    }
+
+    /// FAIM: `State::issue_tls13_ticket` on the current state, for a server.
+    pub(crate) fn issue_tls13_ticket(
+        &mut self,
+        lifetime: u32,
+        max_early_data: u32,
+    ) -> Result<(), Error> {
+        let mut cx = Context {
+            common: &mut self.common_state,
+            data: &mut self.data,
+            sendable_plaintext: None,
+        };
+        match &mut self.state {
+            Ok(st) => st.issue_tls13_ticket(&mut cx, lifetime, max_early_data),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    /// FAIM: `State::end_early_data` on the current state.
+    pub(crate) fn end_early_data(
+        &mut self,
+        sendable_plaintext: &mut ChunkVecBuffer,
+    ) -> Result<(), Error> {
+        let state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
+            Ok(state) => state,
+            Err(e) => {
+                self.state = Err(e.clone());
+                return Err(e);
+            }
+        };
+        let mut cx = Context {
+            common: &mut self.common_state,
+            data: &mut self.data,
+            sendable_plaintext: Some(sendable_plaintext),
+        };
+        match state.end_early_data(&mut cx) {
+            Ok(state) => {
+                self.state = Ok(state);
+                Ok(())
+            }
+            Err(e) => {
+                self.state = Err(e.clone());
+                Err(e)
+            }
         }
     }
 }

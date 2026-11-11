@@ -16,7 +16,7 @@ use crate::common_state::{
 };
 use crate::conn::ConnectionRandoms;
 use crate::conn::kernel::{Direction, KernelContext, KernelState};
-use crate::crypto::hash::Hash;
+use crate::crypto::hash::{self, Hash};
 use crate::crypto::{ActiveKeyExchange, SharedSecret};
 use crate::enums::{
     AlertDescription, ContentType, HandshakeType, ProtocolVersion, SignatureScheme,
@@ -373,6 +373,25 @@ pub(super) fn fill_in_psk_binder(
     key_schedule
 }
 
+/// FAIM: fills in the binder of the one identity `message`, a rendered template hello,
+/// offers, and returns the key schedule it started. The binders are the last thing in a
+/// `ClientHello` (RFC 8446 §4.2.11).
+pub(super) fn fill_in_template_psk_binder(
+    resuming: &Retrieved<&persist::Tls13ClientSessionValue>,
+    transcript: &HandshakeHashBuffer,
+    message: &mut [u8],
+) -> KeyScheduleEarly {
+    let suite = resuming.suite();
+    let suite_hash = suite.common.hash_provider;
+    // The list's two-byte length and the binder's one-byte length come first.
+    let binders = message.len() - suite_hash.output_len() - 3;
+    let handshake_hash = transcript.hash_given(suite_hash, &message[..binders]);
+    let key_schedule = KeyScheduleEarly::new(suite, resuming.secret());
+    let binder = key_schedule.resumption_psk_binder_key_and_sign_verify_data(&handshake_hash);
+    message[binders + 3..].copy_from_slice(binder.as_ref());
+    key_schedule
+}
+
 pub(super) fn prepare_resumption(
     config: &ClientConfig,
     cx: &mut ClientContext<'_>,
@@ -508,8 +527,9 @@ impl State<ClientConnectionData> for ExpectEncryptedExtensions {
         if self.config.hello_template.is_some() {
             hs::template::note_encrypted_extensions(cx, exts, &self.config)?;
             cx.data.template_offered = self.hello.sent_extensions.clone();
-            cx.data.template_flight.encrypted_extensions =
-                Some(hs::template::encoded(&m).to_vec());
+            cx.data
+                .template_flight
+                .encrypted_extensions = Some(hs::template::encoded(&m).to_vec());
         }
         hs::process_alpn_protocol(
             cx.common,
@@ -1083,8 +1103,11 @@ impl State<ClientConnectionData> for ExpectCompressedCertificate {
             let mut message = vec![u8::from(HandshakeType::Certificate), len[1], len[2], len[3]];
             message.extend_from_slice(&decompress_buffer);
             cx.data.template_flight.certificate = message;
-            cx.data.template_flight.certificate_compression =
-                Some(faim_template::CertificateCompression(u16::from(compressed_cert.alg)));
+            cx.data
+                .template_flight
+                .certificate_compression = Some(faim_template::CertificateCompression(u16::from(
+                compressed_cert.alg,
+            )));
         }
 
         let m = Message {
@@ -1420,6 +1443,74 @@ impl State<ClientConnectionData> for ExpectFinished {
         st.transcript.add_message(&m);
 
         let hash_after_handshake = st.transcript.current_hash();
+
+        // FAIM: faim-http ends early data once its client's handshake with it completes.
+        if cx.common.early_traffic && st.config.hold_early_data {
+            cx.common.early_data_held = Some(cx.data.early_data.bytes_left());
+            return Ok(Box::new(HoldingEarlyData {
+                finished: st,
+                hash_after_handshake,
+                fin,
+            }));
+        }
+
+        st.finish(cx, hash_after_handshake, fin)
+    }
+
+    fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
+        self
+    }
+}
+
+/// FAIM: a handshake held open past the server's `Finished`, until
+/// `ClientConnection::end_early_data`. What is written goes out as early data meanwhile.
+struct HoldingEarlyData {
+    finished: ExpectFinished,
+    hash_after_handshake: hash::Output,
+    fin: verify::FinishedMessageVerified,
+}
+
+impl State<ClientConnectionData> for HoldingEarlyData {
+    fn handle<'m>(
+        self: Box<Self>,
+        _cx: &mut ClientContext<'_>,
+        m: Message<'m>,
+    ) -> hs::NextStateOrError<'m>
+    where
+        Self: 'm,
+    {
+        // The server sends nothing that needs an answer before FAIM's `Finished`.
+        Err(crate::check::inappropriate_message(&m.payload, &[]))
+    }
+
+    fn end_early_data(
+        self: Box<Self>,
+        cx: &mut ClientContext<'_>,
+    ) -> Result<Box<dyn State<ClientConnectionData>>, Error> {
+        cx.common.early_data_held = None;
+        let Self {
+            finished,
+            hash_after_handshake,
+            fin,
+        } = *self;
+        finished.finish(cx, hash_after_handshake, fin)
+    }
+
+    fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
+        self
+    }
+}
+
+impl ExpectFinished {
+    /// What follows the server's `Finished`: the client's flight, and the move to
+    /// application traffic keys.
+    fn finish(
+        self,
+        cx: &mut ClientContext<'_>,
+        hash_after_handshake: hash::Output,
+        fin: verify::FinishedMessageVerified,
+    ) -> hs::NextStateOrError<'static> {
+        let mut st = self;
         /* The EndOfEarlyData message to server is still encrypted with early data keys,
          * but appears in the transcript after the server Finished. */
         if cx.common.early_traffic {
@@ -1534,10 +1625,6 @@ impl State<ClientConnectionData> for ExpectFinished {
             true => Box::new(ExpectQuicTraffic(st)),
             false => Box::new(st),
         })
-    }
-
-    fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
-        self
     }
 }
 

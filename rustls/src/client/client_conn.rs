@@ -226,6 +226,14 @@ pub struct ClientConfig {
     /// The default is false.
     pub enable_early_data: bool,
 
+    /// FAIM: whether a connection whose early data the server accepted holds its handshake
+    /// open at the server's `Finished`, sending what is written as early data until
+    /// [`ClientConnection::end_early_data`], rather than ending it there.
+    ///
+    /// faim-http sends a client's early data on only once that client's handshake with
+    /// it has completed (faim-http#199), which is after the server's `Finished` has come.
+    pub hold_early_data: bool,
+
     /// If set to `true`, requires the server to support the extended
     /// master secret extraction method defined in [RFC 7627].
     ///
@@ -724,7 +732,7 @@ mod connection {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
         }
 
-        fn bytes_left(&self) -> usize {
+        pub(crate) fn bytes_left(&self) -> usize {
             self.left
         }
     }
@@ -811,14 +819,39 @@ mod connection {
             self.inner.dangerous_extract_secrets()
         }
 
+        /// FAIM: whether this connection is holding its early data open
+        /// (`ClientConfig::hold_early_data`), so [`Self::end_early_data`] has to end it.
+        pub fn early_data_held(&self) -> bool {
+            self.inner
+                .core
+                .common_state
+                .early_data_held
+                .is_some()
+        }
+
+        /// FAIM: ends the early data this connection is holding open and completes its
+        /// handshake. Whatever didn't fit in the early data goes out with it.
+        ///
+        /// # Errors
+        ///
+        /// When it isn't holding early data open.
+        pub fn end_early_data(&mut self) -> Result<(), Error> {
+            self.inner.end_early_data()
+        }
+
         /// FAIM: the handshake messages the server answered `ClientConfig::hello_template`
         /// with, decrypted, for faim-http to read as a server template (faim-http#197).
         ///
-        /// `None` without a template, and until the server's `Certificate` has arrived.
-        /// Its `new_session_tickets` is empty: tickets arrive after the handshake, and
-        /// mirroring them is faim-http#199.
+        /// `None` without a template, and until the server's `ServerHello` has arrived; a
+        /// resumed handshake sends no certificate. Its `new_session_tickets` is empty:
+        /// tickets arrive after the handshake, and reach faim-http through
+        /// `ClientConfig::resumption`'s store (faim-http#199).
         pub fn server_flight(&self) -> Option<faim_template::ServerFlight<'_>> {
-            self.inner.core.data.template_flight.as_flight()
+            self.inner
+                .core
+                .data
+                .template_flight
+                .as_flight()
         }
 
         /// Return the connection's Encrypted Client Hello (ECH) status.

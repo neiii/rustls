@@ -176,6 +176,7 @@ pub(super) fn server_hello(
     session_id: &[u8],
     suite: CipherSuite,
     key_share: Option<(crate::msgs::enums::NamedGroup, &[u8])>,
+    selected_psk: Option<u16>,
 ) -> Result<HandshakeMessagePayload<'static>, Error> {
     let values = ServerHelloValues {
         random,
@@ -184,6 +185,7 @@ pub(super) fn server_hello(
         key_share: key_share.map(|(group, key)| {
             faim_template::KeyShare::new(faim_template::NamedGroup(u16::from(group)), key.to_vec())
         }),
+        selected_psk,
     };
     let rendered = answer
         .render_server_hello(&values)
@@ -196,14 +198,13 @@ pub(super) fn record_version(answer: &Answer) -> ProtocolVersion {
     ProtocolVersion::from(answer.record_version().0)
 }
 
-/// The `EncryptedExtensions` the template renders, after applying what they agree to:
-/// ALPN, ALPS, which the client answers before its `Finished`, and record size limits.
+/// The `EncryptedExtensions` the template renders, noting ALPS, which the client answers
+/// before its `Finished`. The caller has already called [`agree`], since whether early
+/// data can be accepted depends on the ALPN it picks.
 pub(super) fn encrypted_extensions(
     answer: &Answer,
     cx: &mut ServerContext<'_>,
-    configured: Option<usize>,
 ) -> Result<HandshakeMessagePayload<'static>, Error> {
-    agree(answer, cx, ProtocolVersion::TLSv1_3, configured)?;
     cx.data.template_alps = answer.alps.map(|kind| kind.0);
     let rendered = answer
         .render_encrypted_extensions()
