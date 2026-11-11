@@ -38,6 +38,9 @@ pub struct CommonState {
     pub(crate) alpn_protocol: Option<ProtocolName>,
     pub(crate) aligned_handshake: bool,
     pub(crate) may_send_application_data: bool,
+    /// FAIM: how much more early data this client may write, while it holds its handshake
+    /// open past the server's `Finished` (`ClientConfig::hold_early_data`).
+    pub(crate) early_data_held: Option<usize>,
     pub(crate) may_receive_application_data: bool,
     pub(crate) early_traffic: bool,
     sent_fatal_alert: bool,
@@ -75,6 +78,7 @@ impl CommonState {
             alpn_protocol: None,
             aligned_handshake: true,
             may_send_application_data: false,
+            early_data_held: None,
             may_receive_application_data: false,
             early_traffic: false,
             sent_fatal_alert: false,
@@ -112,6 +116,11 @@ impl CommonState {
     ///
     /// [`Connection::process_new_packets()`]: crate::Connection::process_new_packets
     pub fn is_handshaking(&self) -> bool {
+        // FAIM: a client holding its early data open has read all it needs, and goes on
+        // writing early data until `ClientConnection::end_early_data`.
+        if self.early_data_held.is_some() {
+            return false;
+        }
         !(self.may_send_application_data && self.may_receive_application_data)
     }
 
@@ -811,7 +820,28 @@ impl CommonState {
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> usize {
         self.perhaps_write_key_update();
+        // FAIM: while early data is held open, what is written goes out as early data.
+        // Once the window is used up, or behind what was written before the hold, it waits
+        // in order for the end of the handshake.
+        if self
+            .early_data_held
+            .is_some_and(|left| left > 0)
+            && sendable_plaintext.is_empty()
+        {
+            return self.send_held_early_data(&payload.to_vec());
+        }
         self.send_plain(payload, Limit::Yes, sendable_plaintext)
+    }
+
+    /// FAIM: sends what of `plaintext` the held early data window still takes, as early
+    /// data. Returns how many bytes it took.
+    fn send_held_early_data(&mut self, plaintext: &[u8]) -> usize {
+        let Some(left) = self.early_data_held else {
+            return 0;
+        };
+        let taken = self.send_early_plaintext(&plaintext[..left.min(plaintext.len())]);
+        self.early_data_held = Some(left - taken);
+        taken
     }
 
     pub(crate) fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
@@ -937,6 +967,26 @@ pub(crate) trait State<Data>: Send + Sync {
     }
 
     fn send_key_update_request(&mut self, _common: &mut CommonState) -> Result<(), Error> {
+        Err(Error::HandshakeNotComplete)
+    }
+
+    /// FAIM: issues the client one TLS 1.3 ticket with this `lifetime` hint and
+    /// `max_early_data` (`ServerConnection::issue_tls13_ticket`).
+    fn issue_tls13_ticket(
+        &mut self,
+        _cx: &mut Context<'_, Data>,
+        _lifetime: u32,
+        _max_early_data: u32,
+    ) -> Result<(), Error> {
+        Err(Error::HandshakeNotComplete)
+    }
+
+    /// FAIM: ends held early data and completes the handshake
+    /// (`ClientConnection::end_early_data`).
+    fn end_early_data(
+        self: Box<Self>,
+        _cx: &mut Context<'_, Data>,
+    ) -> Result<Box<dyn State<Data>>, Error> {
         Err(Error::HandshakeNotComplete)
     }
 

@@ -285,12 +285,16 @@ mod client_hello {
             let mut chosen_psk_index = None;
             let mut resumedata = None;
 
-            // FAIM: a server template answers in full, since its ServerHello names no PSK
-            // until faim-http#199 mirrors resumption.
+            // FAIM: a server template accepts a PSK only where the server's answer resumed:
+            // otherwise its ServerHello names none, and it answers in full.
             if let Some(psk_offer) = client_hello
                 .preshared_key_offer
                 .as_ref()
-                .filter(|_| self.answer.is_none())
+                .filter(|_| {
+                    self.answer
+                        .as_ref()
+                        .is_none_or(|answer| answer.resumption.resumed())
+                })
             {
                 // "A client MUST provide a "psk_key_exchange_modes" extension if it
                 //  offers a "pre_shared_key" extension. If clients offer
@@ -391,6 +395,17 @@ mod client_hello {
             }
 
             let full_handshake = resumedata.is_none();
+            // FAIM: the server resumed, but this client's PSK couldn't be.
+            if full_handshake
+                && self
+                    .answer
+                    .as_ref()
+                    .is_some_and(|answer| answer.resumption.resumed())
+            {
+                cx.data
+                    .template_shortfalls
+                    .push(faim_template::ServerShortfall::Resumption);
+            }
             self.transcript.add_message(chm);
             let key_schedule = emit_server_hello(
                 &mut self.transcript,
@@ -577,6 +592,7 @@ mod client_hello {
                     session_id.as_ref(),
                     suite.common.suite,
                     Some((ckx.group, &ckx.pub_key)),
+                    chosen_psk_idx.map(|idx| idx as u16),
                 )?),
             },
             None => {
@@ -757,15 +773,31 @@ mod client_hello {
         send_tickets: usize,
         answer: Option<&faim_template::Answer>,
     ) -> Result<EarlyDataDecision, Error> {
-        // FAIM: the server template's `EncryptedExtensions`, as it renders. Nothing here
-        // resumes, so early data is never accepted.
+        // FAIM: the server template's `EncryptedExtensions`, as it renders. Early data is
+        // accepted only if the server accepted FAIM's and rustls would accept the client's.
         if let Some(answer) = answer {
-            flight.add(template::encrypted_extensions(
+            template::agree(
                 answer,
                 cx,
+                ProtocolVersion::TLSv1_3,
                 config.max_fragment_size,
-            )?);
-            return Ok(decide_if_early_data_allowed(cx, hello, None, suite, config));
+            )?;
+            let decision = decide_if_early_data_allowed(cx, hello, resuming, suite, config);
+            let accepted =
+                answer.resumption.early_data() && decision == EarlyDataDecision::Accepted;
+            let without_early_data;
+            let sent = match accepted {
+                true => answer,
+                false => {
+                    without_early_data = answer.without_early_data();
+                    &without_early_data
+                }
+            };
+            flight.add(template::encrypted_extensions(sent, cx)?);
+            return Ok(match decision {
+                EarlyDataDecision::Accepted if !accepted => EarlyDataDecision::RequestedButRejected,
+                decision => decision,
+            });
         }
 
         let mut ep = hs::ExtensionProcessing::new(extra_exts);
@@ -1414,6 +1446,12 @@ struct ExpectFinished {
     send_tickets: usize,
 }
 
+/// FAIM: the terms of a ticket `ServerConnection::issue_tls13_ticket` issues.
+struct MirroredTicket {
+    lifetime: u32,
+    max_early_data: u32,
+}
+
 impl ExpectFinished {
     fn emit_ticket(
         flight: &mut HandshakeFlightTls13<'_>,
@@ -1422,6 +1460,21 @@ impl ExpectFinished {
         resumption: &KeyScheduleResumption,
         config: &ServerConfig,
     ) -> Result<(), Error> {
+        if let Some(ticket) = Self::new_ticket(suite, cx, resumption, config, None)? {
+            flight.add(ticket);
+        }
+        Ok(())
+    }
+
+    /// A `NewSessionTicket`, or `None` when there's no way to store one. `mirrored` says
+    /// what faim-http asked for in place of the configuration's terms.
+    fn new_ticket(
+        suite: &'static Tls13CipherSuite,
+        cx: &ServerContext<'_>,
+        resumption: &KeyScheduleResumption,
+        config: &ServerConfig,
+        mirrored: Option<MirroredTicket>,
+    ) -> Result<Option<HandshakeMessagePayload<'static>>, Error> {
         let secure_random = config.provider.secure_random;
         let nonce = rand::random_vec(secure_random, 32)?;
         let age_add = rand::random_u32(secure_random)?;
@@ -1434,7 +1487,7 @@ impl ExpectFinished {
         let stateless = config.ticketer.enabled();
         let (ticket, lifetime) = if stateless {
             let Some(ticket) = config.ticketer.encrypt(&plain) else {
-                return Ok(());
+                return Ok(None);
             };
             (ticket, config.ticketer.lifetime())
         } else {
@@ -1444,17 +1497,21 @@ impl ExpectFinished {
                 .put(id.clone(), plain);
             if !stored {
                 trace!("resumption not available; not issuing ticket");
-                return Ok(());
+                return Ok(None);
             }
             let stateful_lifetime = 24 * 60 * 60; // this is a bit of a punt
             (id, stateful_lifetime)
         };
 
+        let (lifetime, max_early_data) = match mirrored {
+            Some(mirrored) => (mirrored.lifetime, mirrored.max_early_data),
+            None => (lifetime, config.max_early_data_size),
+        };
         let mut payload = NewSessionTicketPayloadTls13::new(lifetime, age_add, nonce, ticket);
 
-        if config.max_early_data_size > 0 {
+        if max_early_data > 0 {
             if !stateless {
-                payload.extensions.max_early_data_size = Some(config.max_early_data_size);
+                payload.extensions.max_early_data_size = Some(max_early_data);
             } else {
                 // We implement RFC8446 section 8.1: by enforcing that 0-RTT is
                 // only possible if using stateful resumption
@@ -1464,9 +1521,7 @@ impl ExpectFinished {
 
         let t = HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(payload));
         trace!("sending new ticket {t:?} (stateless: {stateless})");
-        flight.add(t);
-
-        Ok(())
+        Ok(Some(t))
     }
 }
 
@@ -1531,6 +1586,9 @@ impl State<ServerConnectionData> for ExpectFinished {
             false => Box::new(ExpectTraffic {
                 key_schedule: key_schedule_traffic,
                 _fin_verified: fin,
+                config: self.config,
+                suite: self.suite,
+                resumption,
             }),
         })
     }
@@ -1544,6 +1602,10 @@ impl State<ServerConnectionData> for ExpectFinished {
 struct ExpectTraffic {
     key_schedule: KeyScheduleTraffic,
     _fin_verified: verify::FinishedMessageVerified,
+    /// FAIM: what `ServerConnection::issue_tls13_ticket` needs.
+    config: Arc<ServerConfig>,
+    suite: &'static Tls13CipherSuite,
+    resumption: KeyScheduleResumption,
 }
 
 impl ExpectTraffic {
@@ -1620,6 +1682,35 @@ impl State<ServerConnectionData> for ExpectTraffic {
     fn send_key_update_request(&mut self, common: &mut CommonState) -> Result<(), Error> {
         self.key_schedule
             .request_key_update_and_update_encrypter(common)
+    }
+
+    fn issue_tls13_ticket(
+        &mut self,
+        cx: &mut ServerContext<'_>,
+        lifetime: u32,
+        max_early_data: u32,
+    ) -> Result<(), Error> {
+        let mirrored = MirroredTicket {
+            lifetime,
+            max_early_data,
+        };
+        let ticket = ExpectFinished::new_ticket(
+            self.suite,
+            cx,
+            &self.resumption,
+            &self.config,
+            Some(mirrored),
+        )?;
+        if let Some(ticket) = ticket {
+            cx.common.send_msg(
+                Message {
+                    version: ProtocolVersion::TLSv1_3,
+                    payload: MessagePayload::handshake(ticket),
+                },
+                true,
+            );
+        }
+        Ok(())
     }
 
     fn into_external_state(self: Box<Self>) -> Result<Box<dyn KernelState + 'static>, Error> {

@@ -14,7 +14,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub(in crate::client) use faim_template::Shortfall;
-use faim_template::{ClientTemplate, EchPayload, Fresh, KeyShare, KeyShareSlot, RetryRequest};
+use faim_template::{
+    ClientTemplate, EchPayload, Fresh, KeyShare, KeyShareSlot, Psk, PskIdentity, RetryRequest,
+};
 use pki_types::ServerName;
 
 use super::{
@@ -40,6 +42,7 @@ use crate::msgs::handshake::{
     ServerExtensions, ServerHelloPayload, SessionId,
 };
 use crate::msgs::message::{Message, MessagePayload};
+use crate::msgs::persist;
 use crate::sync::Arc;
 
 /// The `delegated_credential` extension (RFC 9345). A server that sends one signs the
@@ -64,11 +67,10 @@ pub(in crate::client) struct KeptFlight {
 }
 
 impl KeptFlight {
-    /// The flight as `faim_template` reads it, once it holds a `ServerHello` and a
-    /// `Certificate`: a finished handshake that sent a template's hello always does, as
-    /// the fork offers no session to resume.
+    /// The flight as `faim_template` reads it, once it holds a `ServerHello`. A
+    /// resumed handshake has no `Certificate` to keep.
     pub(in crate::client) fn as_flight(&self) -> Option<faim_template::ServerFlight<'_>> {
-        if self.server_hello.is_empty() || self.certificate.is_empty() {
+        if self.server_hello.is_empty() {
             return None;
         }
         Some(faim_template::ServerFlight {
@@ -159,6 +161,25 @@ pub(super) fn emit_client_hello(
     };
     let random = config.provider.secure_random;
 
+    // FAIM: the session this connection resumes, if faim-http gave it one. A retry resumes
+    // it only under a suite that can (RFC 8446 §4.2.11).
+    let resuming = input.resuming.take();
+    let session = tls13_session(&resuming, retry.as_ref());
+    // Early data needs a session that allows it, on a first hello that offers it.
+    let early_data = session
+        .as_ref()
+        .filter(|session| {
+            config.enable_early_data
+                && retryreq.is_none()
+                && session.max_early_data_size() > 0
+                && template.offers(faim_template::ExtensionType::EARLY_DATA)
+        })
+        .map(|session| session.max_early_data_size() as usize);
+    let template = match early_data {
+        Some(_) => template,
+        None => Cow::Owned(template.without_early_data()),
+    };
+
     let mut fresh = Fresh::new(input.random.0, input.session_id.as_ref().to_vec());
     fresh.server_name = match &input.server_name {
         // RFC 6066: no trailing dot, as stock rustls's `ServerNamePayload` sends it.
@@ -235,9 +256,29 @@ pub(super) fn emit_client_hello(
     }
     input.template_ech = fresh.ech.clone();
 
-    let rendered = template
+    if let Some(session) = &session {
+        cx.common.suite = Some(session.suite().into());
+        let binder = vec![
+            0;
+            session
+                .suite()
+                .common
+                .hash_provider
+                .output_len()
+        ];
+        fresh.psk = Some(Psk::new(vec![PskIdentity::new(
+            session.ticket().to_vec(),
+            session.obfuscated_ticket_age(),
+            binder,
+        )]));
+    }
+
+    let mut rendered = template
         .render(&fresh)
         .map_err(|error| Error::General(error.to_string()))?;
+    let early_data_key_schedule = session.as_ref().map(|session| {
+        tls13::fill_in_template_psk_binder(session, &transcript_buffer, &mut rendered.message)
+    });
     // rustls reads the hello it sends, as it would its own, for what it checks the
     // server's answer against.
     let payload = MessagePayload::new(
@@ -283,11 +324,28 @@ pub(super) fn emit_client_hello(
     transcript_buffer.add_message(&ch);
     cx.common.send_msg(ch, false);
 
+    if let (Some(session), Some(schedule), Some(max)) =
+        (&session, &early_data_key_schedule, early_data)
+    {
+        cx.data.early_data.enable(max);
+        tls13::derive_early_traffic_secret(
+            &*config.key_log,
+            cx,
+            session.suite().common.hash_provider,
+            schedule,
+            &mut input.sent_tls13_fake_ccs,
+            &transcript_buffer,
+            &input.random.0,
+        );
+    }
+    drop(session);
+    input.resuming = resuming;
+
     let mut active = active.into_iter();
     let next = ExpectServerHello {
         input,
         transcript_buffer,
-        early_data_key_schedule: None,
+        early_data_key_schedule,
         offered_key_share: active.next(),
         template_shares: active.collect(),
         suite: retry.map(|retry| retry.suite),
@@ -301,6 +359,28 @@ pub(super) fn emit_client_hello(
     } else {
         Box::new(next)
     })
+}
+
+/// The TLS 1.3 session in `resuming` to offer, if there is one a `retry` can still offer.
+fn tls13_session<'a>(
+    resuming: &'a Option<persist::Retrieved<super::ClientSessionValue>>,
+    retry: Option<&Retry<'_>>,
+) -> Option<persist::Retrieved<&'a persist::Tls13ClientSessionValue>> {
+    let session = resuming
+        .as_ref()?
+        .map(|value| value.tls13())?;
+    if session.ticket().is_empty() {
+        return None;
+    }
+    match retry.map(|retry| retry.suite) {
+        None => {}
+        Some(SupportedCipherSuite::Tls13(suite)) => {
+            suite.can_resume_from(session.suite())?;
+        }
+        #[cfg(feature = "tls12")]
+        Some(SupportedCipherSuite::Tls12(_)) => return None,
+    }
+    Some(session)
 }
 
 /// Checks the protocol version a server picked against what `template` offered.

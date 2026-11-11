@@ -300,11 +300,27 @@ impl ClientSessionCommon {
         &self.server_cert_chain
     }
 
+    /// FAIM: how many bytes the server's certificate chain holds, which faim-http counts
+    /// against its memory budget.
+    pub fn server_cert_chain_len(&self) -> usize {
+        self.server_cert_chain
+            .iter()
+            .map(|certificate| certificate.as_ref().len())
+            .sum()
+    }
+
+    /// FAIM: the lifetime hint the server gave this ticket, capped at the most a ticket may
+    /// last; faim-http issues its client the same.
+    pub fn lifetime_secs(&self) -> u32 {
+        self.lifetime_secs
+    }
+
     pub(crate) fn secret(&self) -> &[u8] {
         self.secret.0.as_ref()
     }
 
-    pub(crate) fn ticket(&self) -> &[u8] {
+    /// FAIM: the server's ticket.
+    pub fn ticket(&self) -> &[u8] {
         self.ticket.0.as_ref()
     }
 }

@@ -226,6 +226,24 @@ pub struct ClientConfig {
     /// The default is false.
     pub enable_early_data: bool,
 
+    /// FAIM: whether a connection whose early data the server accepted holds its handshake
+    /// open at the server's `Finished`, sending what is written as early data until
+    /// [`ClientConnection::end_early_data`], rather than ending it there. Plaintext written
+    /// before the hold keeps its place: anything written behind it waits with it for the
+    /// end of the handshake, as does what doesn't fit the session's early data limit.
+    ///
+    /// faim-http sends a client's early data on only once that client's handshake with
+    /// it has completed (faim-http#199), which is after the server's `Finished` has come.
+    pub hold_early_data: bool,
+
+    /// FAIM: whether a template's connection resumes whatever `resumption`'s store hands it,
+    /// without checking the session was made under this configuration's verifier and client
+    /// credentials. It is for a store whose owner has already checked that: faim-http builds
+    /// a configuration per connection, so the check, which compares them by address, could
+    /// never pass, and it files each session under the upstream and certificate check it
+    /// came from. `false` keeps rustls's check.
+    pub resumes_session_as_given: bool,
+
     /// If set to `true`, requires the server to support the extended
     /// master secret extraction method defined in [RFC 7627].
     ///
@@ -606,6 +624,11 @@ pub(super) struct EarlyData {
 }
 
 impl EarlyData {
+    /// How much more early data may be written.
+    pub(super) fn bytes_left(&self) -> usize {
+        self.left
+    }
+
     fn new() -> Self {
         Self {
             left: 0,
@@ -723,10 +746,6 @@ mod connection {
             self.check_write_opt(sz)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
         }
-
-        fn bytes_left(&self) -> usize {
-            self.left
-        }
     }
 
     /// This represents a single TLS client connection.
@@ -811,14 +830,39 @@ mod connection {
             self.inner.dangerous_extract_secrets()
         }
 
+        /// FAIM: whether this connection is holding its early data open
+        /// (`ClientConfig::hold_early_data`), so [`Self::end_early_data`] has to end it.
+        pub fn early_data_held(&self) -> bool {
+            self.inner
+                .core
+                .common_state
+                .early_data_held
+                .is_some()
+        }
+
+        /// FAIM: ends the early data this connection is holding open and completes its
+        /// handshake. Whatever didn't fit in the early data goes out with it.
+        ///
+        /// # Errors
+        ///
+        /// When it isn't holding early data open.
+        pub fn end_early_data(&mut self) -> Result<(), Error> {
+            self.inner.end_early_data()
+        }
+
         /// FAIM: the handshake messages the server answered `ClientConfig::hello_template`
         /// with, decrypted, for faim-http to read as a server template (faim-http#197).
         ///
-        /// `None` without a template, and until the server's `Certificate` has arrived.
-        /// Its `new_session_tickets` is empty: tickets arrive after the handshake, and
-        /// mirroring them is faim-http#199.
+        /// `None` without a template, and until the server's `ServerHello` has arrived; a
+        /// resumed handshake sends no certificate. Its `new_session_tickets` is empty:
+        /// tickets arrive after the handshake, and reach faim-http through
+        /// `ClientConfig::resumption`'s store (faim-http#199).
         pub fn server_flight(&self) -> Option<faim_template::ServerFlight<'_>> {
-            self.inner.core.data.template_flight.as_flight()
+            self.inner
+                .core
+                .data
+                .template_flight
+                .as_flight()
         }
 
         /// Return the connection's Encrypted Client Hello (ECH) status.

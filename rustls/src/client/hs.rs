@@ -94,11 +94,7 @@ impl ClientHelloInput {
         cx: &mut ClientContext<'_>,
         config: Arc<ClientConfig>,
     ) -> Result<Self, Error> {
-        // FAIM: a hello from a template offers no session to resume (faim-http#199).
-        let mut resuming = match config.hello_template {
-            Some(_) => None,
-            None => ClientSessionValue::retrieve(&server_name, &config, cx),
-        };
+        let mut resuming = ClientSessionValue::retrieve(&server_name, &config, cx);
         let session_id = match &mut resuming {
             Some(_resuming) => {
                 debug!("Resuming session");
@@ -739,7 +735,12 @@ impl State<ClientConnectionData> for ExpectServerHello {
             require_handshake_msg!(m, HandshakeType::ServerHello, HandshakePayload::ServerHello)?;
         trace!("We got ServerHello {server_hello:#?}");
         // FAIM: kept for `ClientConnection::server_flight`.
-        if self.input.config.hello_template.is_some() {
+        if self
+            .input
+            .config
+            .hello_template
+            .is_some()
+        {
             template::keep_server_hello(cx, &m);
         }
 
@@ -1304,6 +1305,11 @@ impl ClientSessionValue {
                 None
             })
             .and_then(|resuming| {
+                // FAIM: faim-http's store hands over the one session it chose for this
+                // connection, under a configuration made for it alone.
+                if config.resumes_session_as_given {
+                    return Some(resuming);
+                }
                 resuming.compatible_config(&config.verifier, &config.client_auth_cert_resolver)
             })
             .and_then(|resuming| {
