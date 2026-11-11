@@ -181,6 +181,8 @@ fn what_a_server_writes_before_a_held_handshake_ends_is_read_once_it_ends() {
     server.process_new_packets().unwrap();
     transfer(&mut server, &mut client);
     client.process_new_packets().unwrap();
+    // A read loop goes on processing while held, and the bytes behind `Finished` wait.
+    client.process_new_packets().unwrap();
 
     assert!(client.early_data_held());
     client.end_early_data().unwrap();
@@ -190,6 +192,44 @@ fn what_a_server_writes_before_a_held_handshake_ends_is_read_once_it_ends() {
         .read_exact(&mut read)
         .unwrap();
     assert_eq!(read, b"half rtt");
+}
+
+#[test]
+fn what_was_written_before_the_hold_stays_ahead_of_what_is_written_during_it() {
+    let (client, server) = configs();
+    let config = holding_config(&client, &server);
+    let (mut client, mut server) = make_pair_for_arc_configs(&config, &server);
+    client
+        .writer()
+        .write_all(b"first")
+        .unwrap();
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    transfer(&mut server, &mut client);
+    client.process_new_packets().unwrap();
+    assert!(client.early_data_held());
+
+    client
+        .writer()
+        .write_all(b"second")
+        .unwrap();
+    client.end_early_data().unwrap();
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+
+    let mut early = Vec::new();
+    server
+        .early_data()
+        .unwrap()
+        .read_to_end(&mut early)
+        .unwrap();
+    assert_eq!(early, b"");
+    let mut read = vec![0; 11];
+    server
+        .reader()
+        .read_exact(&mut read)
+        .unwrap();
+    assert_eq!(read, b"firstsecond");
 }
 
 #[test]
@@ -235,7 +275,12 @@ fn issuing_a_ticket_before_the_handshake_completes_is_refused() {
 #[test]
 fn ending_early_data_a_connection_isnt_holding_is_refused() {
     let (client_config, server_config) = configs();
-    let (mut client, _server) = make_pair_for_arc_configs(&client_config, &server_config);
+    let (mut client, _) = make_pair_for_arc_configs(&client_config, &server_config);
 
     assert_eq!(client.end_early_data(), Err(Error::HandshakeNotComplete));
+
+    // A refused call leaves the connection as it was.
+    let mut server = ServerConnection::new(server_config).unwrap();
+    do_handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
 }

@@ -821,10 +821,12 @@ impl CommonState {
     ) -> usize {
         self.perhaps_write_key_update();
         // FAIM: while early data is held open, what is written goes out as early data.
-        // Once the window is used up it waits, in order, for the end of the handshake.
+        // Once the window is used up, or behind what was written before the hold, it waits
+        // in order for the end of the handshake.
         if self
             .early_data_held
             .is_some_and(|left| left > 0)
+            && sendable_plaintext.is_empty()
         {
             return self.send_held_early_data(&payload.to_vec());
         }

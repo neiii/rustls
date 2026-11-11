@@ -916,6 +916,17 @@ impl<Data> ConnectionCore<Data> {
         deframer_buffer: &mut DeframerVecBuffer,
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> Result<IoState, Error> {
+        // FAIM: while early data is held open, what has come in stays buffered: the
+        // decrypter is on the handshake keys, and the server may have written under its
+        // traffic keys. `end_early_data` processes it.
+        if self
+            .common_state
+            .early_data_held
+            .is_some()
+        {
+            return Ok(self.common_state.current_io_state());
+        }
+
         let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
             Ok(state) => state,
             Err(e) => {
@@ -1341,6 +1352,13 @@ impl<Data> ConnectionCore<Data> {
         &mut self,
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> Result<(), Error> {
+        if self
+            .common_state
+            .early_data_held
+            .is_none()
+        {
+            return Err(Error::HandshakeNotComplete);
+        }
         let state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
             Ok(state) => state,
             Err(e) => {
