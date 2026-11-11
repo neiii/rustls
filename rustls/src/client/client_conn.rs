@@ -234,6 +234,14 @@ pub struct ClientConfig {
     /// it has completed (faim-http#199), which is after the server's `Finished` has come.
     pub hold_early_data: bool,
 
+    /// FAIM: whether a template's connection resumes whatever `resumption`'s store hands it,
+    /// without checking the session was made under this configuration's verifier and client
+    /// credentials. It is for a store whose owner has already checked that: faim-http builds
+    /// a configuration per connection, so the check, which compares them by address, could
+    /// never pass, and it files each session under the upstream and certificate check it
+    /// came from. `false` keeps rustls's check.
+    pub resumes_session_as_given: bool,
+
     /// If set to `true`, requires the server to support the extended
     /// master secret extraction method defined in [RFC 7627].
     ///

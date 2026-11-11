@@ -724,7 +724,9 @@ mod connection {
         /// FAIM: issues the client one TLS 1.3 session ticket with this `lifetime` hint,
         /// after the handshake, promising `max_early_data` bytes of early data. faim-http
         /// mirrors each ticket the real server issues (faim-http#199); it goes through
-        /// `ServerConfig::session_storage`, and `ServerConfig::ticketer` must be off.
+        /// `ServerConfig::session_storage`, and `ServerConfig::ticketer` must be off. The
+        /// connection that resumes this ticket enforces its own
+        /// `ServerConfig::max_early_data_size`, so the caller sets that to `max_early_data`.
         ///
         /// # Errors
         ///

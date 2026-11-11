@@ -188,6 +188,7 @@ impl ConfigBuilder<ClientConfig, WantsClientCert> {
             send_ticket_request: None,
             hello_template: None,
             hold_early_data: false,
+            resumes_session_as_given: false,
         }
     }
 }

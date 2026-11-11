@@ -83,6 +83,46 @@ fn a_template_hello_with_an_empty_store_offers_no_psk_and_handshakes_in_full() {
     assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
 }
 
+/// A template config with a verifier of its own, sharing `client`'s session store: what a
+/// strict connection looks like beside a session made under another verifier.
+fn under_another_verifier(
+    client: &Arc<ClientConfig>,
+    template: Arc<ClientTemplate>,
+) -> ClientConfig {
+    let provider = provider::default_provider();
+    let mut config =
+        make_client_config_with_versions(KeyType::Rsa2048, &[&rustls::version::TLS13], &provider);
+    config.resumption = client.resumption.clone();
+    config.hello_template = Some(template);
+    config
+}
+
+#[test]
+fn a_template_hello_wont_resume_a_session_made_under_another_verifier() {
+    let (client, server) = configs();
+    let template = returning_template(&client, &server);
+    let config = under_another_verifier(&client, template);
+
+    let (mut client, mut server) = make_pair_for_arc_configs(&Arc::new(config), &server);
+    do_handshake(&mut client, &mut server);
+
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+}
+
+#[test]
+fn a_config_that_vouches_for_its_store_resumes_what_the_store_hands_it() {
+    let (client, server) = configs();
+    let template = returning_template(&client, &server);
+    let mut config = under_another_verifier(&client, template);
+    config.resumes_session_as_given = true;
+
+    let (mut client, mut server) = make_pair_for_arc_configs(&Arc::new(config), &server);
+    do_handshake(&mut client, &mut server);
+
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+}
+
 /// Runs `client` and `server` to the point the client holds its early data open.
 fn hold(
     config: &Arc<ClientConfig>,

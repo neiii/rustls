@@ -1305,9 +1305,9 @@ impl ClientSessionValue {
                 None
             })
             .and_then(|resuming| {
-                // FAIM: a template's store hands over the one session faim-http chose
-                // for this connection, under a configuration made for it alone.
-                if config.hello_template.is_some() {
+                // FAIM: faim-http's store hands over the one session it chose for this
+                // connection, under a configuration made for it alone.
+                if config.resumes_session_as_given {
                     return Some(resuming);
                 }
                 resuming.compatible_config(&config.verifier, &config.client_auth_cert_resolver)
