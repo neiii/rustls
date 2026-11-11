@@ -581,7 +581,9 @@ impl<Data> ConnectionCommon<Data> {
     /// FAIM: ends the early data this connection holds open (`ClientConfig::hold_early_data`).
     pub(crate) fn end_early_data(&mut self) -> Result<(), Error> {
         self.core
-            .end_early_data(&mut self.sendable_plaintext)
+            .end_early_data(&mut self.sendable_plaintext)?;
+        // What arrived while it was held, which the traffic keys can now read.
+        self.process_new_packets().map(drop)
     }
 
     /// Returns an object that allows reading plaintext.
@@ -951,6 +953,17 @@ impl<Data> ConnectionCore<Data> {
                     deframer_buffer.discard(buffer_progress.take_discard());
                     return Err(e);
                 }
+            }
+
+            // FAIM: a server may write under its traffic keys before the client's `Finished`,
+            // and the decrypter moves to them only once early data ends. What came with the
+            // server's `Finished` waits in the buffer until `end_early_data`.
+            if self
+                .common_state
+                .early_data_held
+                .is_some()
+            {
+                break;
             }
 
             if self

@@ -820,14 +820,13 @@ impl CommonState {
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> usize {
         self.perhaps_write_key_update();
-        // FAIM: while early data is held open, what is written goes out as early data,
-        // and what doesn't fit waits for the end of the handshake with the rest.
-        if self.early_data_held.is_some() {
-            let plaintext = payload.to_vec();
-            return match self.send_held_early_data(&plaintext) {
-                0 => self.send_plain(plaintext.as_slice().into(), Limit::Yes, sendable_plaintext),
-                taken => taken,
-            };
+        // FAIM: while early data is held open, what is written goes out as early data.
+        // Once the window is used up it waits, in order, for the end of the handshake.
+        if self
+            .early_data_held
+            .is_some_and(|left| left > 0)
+        {
+            return self.send_held_early_data(&payload.to_vec());
         }
         self.send_plain(payload, Limit::Yes, sendable_plaintext)
     }

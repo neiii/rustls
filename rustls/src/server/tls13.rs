@@ -783,7 +783,8 @@ mod client_hello {
                 config.max_fragment_size,
             )?;
             let decision = decide_if_early_data_allowed(cx, hello, resuming, suite, config);
-            let accepted = answer.resumption.early_data() && decision == EarlyDataDecision::Accepted;
+            let accepted =
+                answer.resumption.early_data() && decision == EarlyDataDecision::Accepted;
             let without_early_data;
             let sent = match accepted {
                 true => answer,

@@ -166,6 +166,33 @@ fn what_doesnt_fit_a_held_handshakes_early_data_goes_out_after_it_ends() {
 }
 
 #[test]
+fn what_a_server_writes_before_a_held_handshake_ends_is_read_once_it_ends() {
+    let (client, server) = configs();
+    let config = holding_config(&client, &server);
+    let mut halfway = (*server).clone();
+    halfway.send_half_rtt_data = true;
+    let (mut client, mut server) = make_pair_for_arc_configs(&config, &Arc::new(halfway));
+    server
+        .writer()
+        .write_all(b"half rtt")
+        .unwrap();
+
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    transfer(&mut server, &mut client);
+    client.process_new_packets().unwrap();
+
+    assert!(client.early_data_held());
+    client.end_early_data().unwrap();
+    let mut read = vec![0; 8];
+    client
+        .reader()
+        .read_exact(&mut read)
+        .unwrap();
+    assert_eq!(read, b"half rtt");
+}
+
+#[test]
 fn a_ticket_issued_after_the_handshake_carries_the_terms_asked_for_and_resumes() {
     let (client_config, server_config) = configs();
     let mut server_config = (*server_config).clone();
