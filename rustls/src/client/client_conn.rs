@@ -228,7 +228,9 @@ pub struct ClientConfig {
 
     /// FAIM: whether a connection whose early data the server accepted holds its handshake
     /// open at the server's `Finished`, sending what is written as early data until
-    /// [`ClientConnection::end_early_data`], rather than ending it there.
+    /// [`ClientConnection::end_early_data`], rather than ending it there. Plaintext written
+    /// before the hold keeps its place: anything written behind it waits with it for the
+    /// end of the handshake, as does what doesn't fit the session's early data limit.
     ///
     /// faim-http sends a client's early data on only once that client's handshake with
     /// it has completed (faim-http#199), which is after the server's `Finished` has come.
