@@ -811,6 +811,16 @@ mod connection {
             self.inner.dangerous_extract_secrets()
         }
 
+        /// FAIM: the handshake messages the server answered `ClientConfig::hello_template`
+        /// with, decrypted, for faim-http to read as a server template (faim-http#197).
+        ///
+        /// `None` without a template, and until the server's `Certificate` has arrived.
+        /// Its `new_session_tickets` is empty: tickets arrive after the handshake, and
+        /// mirroring them is faim-http#199.
+        pub fn server_flight(&self) -> Option<faim_template::ServerFlight<'_>> {
+            self.inner.core.data.template_flight.as_flight()
+        }
+
         /// Return the connection's Encrypted Client Hello (ECH) status.
         pub fn ech_status(&self) -> EchStatus {
             self.inner.core.data.ech_status
@@ -1093,6 +1103,8 @@ pub struct ClientConnectionData {
     /// FAIM: the extensions a template's hello offered, which the server's certificate
     /// entries may answer.
     pub(super) template_offered: Vec<crate::msgs::enums::ExtensionType>,
+    /// FAIM: what the server answered a template's hello with.
+    pub(super) template_flight: hs::template::KeptFlight,
 }
 
 impl ClientConnectionData {
@@ -1102,6 +1114,7 @@ impl ClientConnectionData {
             ech_status: EchStatus::NotOffered,
             template_alps: None,
             template_offered: Vec::new(),
+            template_flight: hs::template::KeptFlight::default(),
         }
     }
 }
