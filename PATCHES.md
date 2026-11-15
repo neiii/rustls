@@ -8,7 +8,7 @@ Every change is listed with its reason, so a rebase onto a later release can red
 
 ## Building and testing
 
-The fork's `rustls` crate depends on `faim-template = "0.1"`, which crates.io doesn't have. FAIM's own workspace supplies it with `[patch.crates-io]`. Here, this workspace's `[patch.crates-io]` takes it from a faim-http checkout beside this one, at `../faim-http`. faim-template builds on FAIM's nightly toolchain (the `rust` line of faim-http's `mise.toml`), so the fork does too.
+The fork's `rustls` crate depends on `faim-template = "*"`, which crates.io doesn't have. Any version matches, since faim-template takes faim-http's product version, which moves at milestones (faim-http's ADR-0027), and a `[patch.crates-io]` entry only applies when its version meets the requirement. FAIM's own workspace supplies it with `[patch.crates-io]`. Here, this workspace's `[patch.crates-io]` takes it from a faim-http checkout beside this one, at `../faim-http`. faim-template builds on FAIM's nightly toolchain (the `rust` line of faim-http's `mise.toml`), so the fork does too.
 
 - rustls's own tests: `cargo test -p rustls`.
 - BoGo: `cd bogo && BOGO_SHIM_PROVIDER=aws-lc-rs ./runme`, with Go installed.
@@ -21,7 +21,7 @@ A change that touches both repositories merges here first. faim-http then pins t
 
 - **`Cargo.toml`**: `[patch.crates-io]` supplies `faim-template` from `../faim-http` (see above).
 - **`Cargo.lock`**: `aws-lc-rs` 1.19.0 and `aws-lc-sys` 0.47.0, the versions FAIM builds with, so the fork's tests run on the crypto FAIM ships, and `faim-template` with its dependencies. A change that bumps `aws-lc-rs` in faim-http's `Cargo.lock` bumps it here too (`cargo update -p aws-lc-rs --precise <version>`).
-- **`rustls/Cargo.toml`**: depends on `faim-template = "0.1"`.
+- **`rustls/Cargo.toml`**: depends on `faim-template = "*"`, so faim-http's version bumps don't break the patch (see above).
 - **`FAIM_HTTP_REF`** (new): the faim-http commit the `faim` workflow builds faim-template from (see above).
 - **`.github/workflows/`**: upstream's workflows are removed. They build without faim-template, so every one would fail here, and FAIM doesn't need their release or docs jobs. `faim.yml` replaces them, and keeps their feature builds. Their fuzzing and dependency checks aren't replaced here: faim-http's `mise run check` audits the dependency tree it builds this fork into, and fuzzing the template path needs faim-http's corpus.
 
