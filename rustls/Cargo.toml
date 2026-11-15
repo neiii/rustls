@@ -35,7 +35,7 @@ rustversion = { version = "1.0.6", optional = true }
 
 [dependencies]
 # FAIM: the client template the fork sends its hello from (PATCHES.md).
-faim-template = "0.1"
+faim-template = "*"
 aws-lc-rs = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 brotli-decompressor = { workspace = true, optional = true }
