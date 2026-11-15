@@ -52,6 +52,21 @@ const DELEGATED_CREDENTIAL: u16 = 0x0022;
 /// The two `application_settings` codepoints Chromium has sent for ALPS.
 const APPLICATION_SETTINGS: [u16; 2] = [0x4469, 0x44cd];
 
+/// The `trust_anchors` extension (draft-ietf-tls-trust-anchor-ids), which Chrome offers.
+/// A server's answer in `EncryptedExtensions` lists the anchors it has paths for, which
+/// a client uses only to retry after a certificate error (§5.6): it obliges the client
+/// to nothing in a handshake that succeeds.
+const TRUST_ANCHORS: u16 = 0xca34;
+
+/// The extensions rustls doesn't parse that a server's TLS 1.3 `EncryptedExtensions` may
+/// answer: ALPS, which the fork answers before its `Finished`, and `trust_anchors`. The
+/// destructuring stops compiling when `APPLICATION_SETTINGS` gains a codepoint, so this
+/// list can't leave one out.
+const ENCRYPTED_EXTENSIONS_ANSWERED: [u16; 3] = {
+    let [alps, alps_old] = APPLICATION_SETTINGS;
+    [alps, alps_old, TRUST_ANCHORS]
+};
+
 /// The handshake messages a server answered a template's hello with, kept for
 /// [`ClientConnection::server_flight`].
 ///
@@ -613,14 +628,14 @@ pub(in crate::client) fn check_unhandled_extensions(
 
 /// Notes what a template's hello asked of the client that the server's
 /// `EncryptedExtensions` agreed to: ALPS, to answer before the client's `Finished`, and
-/// a record size limit. An answer to any other extension rustls doesn't handle is a
-/// shortfall.
+/// a record size limit. A `trust_anchors` answer obliges the client to nothing. An
+/// answer to any other extension rustls doesn't handle is a shortfall.
 pub(in crate::client) fn note_encrypted_extensions(
     cx: &mut ClientContext<'_>,
     exts: &ServerExtensions<'_>,
     config: &ClientConfig,
 ) -> Result<(), Error> {
-    check_unhandled_extensions(cx.common, exts, &APPLICATION_SETTINGS)?;
+    check_unhandled_extensions(cx.common, exts, &ENCRYPTED_EXTENSIONS_ANSWERED)?;
     cx.data.template_alps = exts
         .unknown_extensions
         .iter()
@@ -704,50 +719,4 @@ impl From<Shortfall> for Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::common_state::Side;
-
-    /// The largest plaintext record a client sends once a server answered with
-    /// `limit`, when `ClientConfig::max_fragment_size` is `configured`.
-    fn largest_record(configured: Option<usize>, limit: u16) -> usize {
-        let mut common = CommonState::new(Side::Client);
-        common
-            .set_max_fragment_size(configured)
-            .unwrap();
-        let exts = ServerExtensions {
-            record_size_limit: Some(limit),
-            ..ServerExtensions::default()
-        };
-        apply_record_size_limit(&mut common, &exts, ProtocolVersion::TLSv1_3, configured).unwrap();
-        let message = Message {
-            version: ProtocolVersion::TLSv1_3,
-            payload: MessagePayload::ApplicationData(Payload::new(vec![0; 20_000])),
-        };
-        common.send_msg(message, false);
-        let mut records = Vec::new();
-        common
-            .sendable_tls
-            .write_to(&mut records)
-            .unwrap();
-        let mut largest = 0;
-        let mut rest = &records[..];
-        while let [_, _, _, high, low, tail @ ..] = rest {
-            let len = usize::from(u16::from_be_bytes([*high, *low]));
-            largest = largest.max(len);
-            rest = &tail[len..];
-        }
-        largest
-    }
-
-    #[test]
-    fn a_record_size_limit_caps_the_records_the_client_sends() {
-        // TLS 1.3 counts the content type byte in the limit.
-        assert_eq!(largest_record(None, 1025), 1024);
-    }
-
-    #[test]
-    fn a_record_size_limit_never_raises_a_configured_fragment_size() {
-        assert_eq!(largest_record(Some(517), 16385), 512);
-    }
-}
+mod tests;
