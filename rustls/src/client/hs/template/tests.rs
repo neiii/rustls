@@ -26,14 +26,22 @@ fn largest_record(configured: Option<usize>, limit: u16) -> usize {
         .sendable_tls
         .write_to(&mut records)
         .unwrap();
-    let mut largest = 0;
-    let mut rest = &records[..];
-    while let [_, _, _, high, low, tail @ ..] = rest {
-        let len = usize::from(u16::from_be_bytes([*high, *low]));
-        largest = largest.max(len);
-        rest = &tail[len..];
-    }
-    largest
+    fragments(&records)
+        .map(|(_, fragment)| fragment.len())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Each record in `records` as its content type and fragment.
+fn fragments(mut records: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    core::iter::from_fn(move || {
+        let [kind, _, _, high, low, rest @ ..] = records else {
+            return None;
+        };
+        let (fragment, tail) = rest.split_at(usize::from(u16::from_be_bytes([*high, *low])));
+        records = tail;
+        Some((*kind, fragment))
+    })
 }
 
 #[test]
@@ -69,7 +77,7 @@ mod scripted {
 
     /// `max_fragment_length` (RFC 6066): an answer caps every record the client sends,
     /// which the fork doesn't do.
-    const MAX_FRAGMENT_LENGTH: u16 = 0x0001;
+    const MAX_FRAGMENT_LENGTH: u16 = faim_template::ExtensionType::MAX_FRAGMENT_LENGTH.0;
 
     /// A `trust_anchors` list naming one trust anchor ID, 32473.1, as a client's hello
     /// and a server's `EncryptedExtensions` carry it.
@@ -299,16 +307,11 @@ mod scripted {
     }
 
     /// The handshake messages in `records`, without their record headers.
-    fn handshake_bytes(mut records: &[u8]) -> Vec<u8> {
-        let mut messages = Vec::new();
-        while let [kind, _, _, high, low, rest @ ..] = records {
-            let len = usize::from(u16::from_be_bytes([*high, *low]));
-            if *kind == u8::from(ContentType::Handshake) {
-                messages.extend_from_slice(&rest[..len]);
-            }
-            records = &rest[len..];
-        }
-        messages
+    fn handshake_bytes(records: &[u8]) -> Vec<u8> {
+        fragments(records)
+            .filter(|(kind, _)| *kind == u8::from(ContentType::Handshake))
+            .flat_map(|(_, fragment)| fragment.iter().copied())
+            .collect()
     }
 
     fn record(kind: ContentType, fragment: &[u8]) -> Vec<u8> {
@@ -379,13 +382,13 @@ mod scripted {
             &server,
         );
 
-        let answered = server.answer(
+        let verdict = server.answer(
             &mut client,
             &[(TRUST_ANCHORS, ONE_TRUST_ANCHOR)],
             &[(TRUST_ANCHORS, &[])],
         );
 
-        assert_eq!(answered, Ok(()));
+        assert_eq!(verdict, Ok(()));
         assert!(!client.is_handshaking());
         assert_eq!(
             client.peer_certificates(),
@@ -404,16 +407,17 @@ mod scripted {
             &server,
         );
 
-        let answered = server.answer(&mut client, &[(MAX_FRAGMENT_LENGTH, &[1])], &[]);
+        let verdict = server.answer(&mut client, &[(MAX_FRAGMENT_LENGTH, &[1])], &[]);
 
         assert_eq!(
-            answered,
+            verdict,
             Err(Error::Shortfall(Shortfall::Extension(
-                faim_template::ExtensionType(MAX_FRAGMENT_LENGTH)
+                faim_template::ExtensionType::MAX_FRAGMENT_LENGTH
             )))
         );
     }
 
+    #[cfg(feature = "tls12")]
     #[test]
     fn a_tls12_server_hello_answering_trust_anchors_is_a_shortfall_naming_it() {
         // The draft defines trust_anchors for TLS 1.3 alone. ECDHE-RSA-AES128-GCM-SHA256,

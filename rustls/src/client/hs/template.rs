@@ -59,12 +59,13 @@ const APPLICATION_SETTINGS: [u16; 2] = [0x4469, 0x44cd];
 const TRUST_ANCHORS: u16 = 0xca34;
 
 /// The extensions rustls doesn't parse that a server's TLS 1.3 `EncryptedExtensions` may
-/// answer: ALPS, which the fork answers before its `Finished`, and `trust_anchors`.
-const ENCRYPTED_EXTENSIONS_ANSWERED: [u16; 3] = [
-    APPLICATION_SETTINGS[0],
-    APPLICATION_SETTINGS[1],
-    TRUST_ANCHORS,
-];
+/// answer: ALPS, which the fork answers before its `Finished`, and `trust_anchors`. The
+/// destructuring stops compiling when `APPLICATION_SETTINGS` gains a codepoint, so this
+/// list can't leave one out.
+const ENCRYPTED_EXTENSIONS_ANSWERED: [u16; 3] = {
+    let [alps, alps_old] = APPLICATION_SETTINGS;
+    [alps, alps_old, TRUST_ANCHORS]
+};
 
 /// The handshake messages a server answered a template's hello with, kept for
 /// [`ClientConnection::server_flight`].
