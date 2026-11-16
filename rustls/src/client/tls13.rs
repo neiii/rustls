@@ -1503,7 +1503,11 @@ impl State<ClientConnectionData> for HoldingEarlyData {
         ) {
             // As a server flooding a client with tickets is met past the store's capacity.
             if self.tickets.len() < HELD_TICKETS {
-                self.tickets.push(m.into_owned());
+                // `Message::into_owned` needs `std`; its payload's doesn't.
+                self.tickets.push(Message {
+                    version: m.version,
+                    payload: m.payload.into_owned(),
+                });
             }
             return Ok(self);
         }
