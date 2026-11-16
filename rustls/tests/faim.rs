@@ -1,9 +1,10 @@
 //! FAIM: resumption through a hello template, tickets issued after the handshake, and
-//! early data held open past the server's `Finished` (faim-http#199).
+//! early data held open past the server's `Finished` (faim-http#199), and early data read
+//! one record at a time (faim-http#498).
 
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 
 use faim_template::{ClientHello, ClientTemplate};
 use rustls::client::{ClientSessionMemoryCache, Resumption};
@@ -323,4 +324,34 @@ fn ending_early_data_a_connection_isnt_holding_is_refused() {
     let mut server = ServerConnection::new(server_config).unwrap();
     do_handshake(&mut client, &mut server);
     assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+}
+
+#[test]
+fn early_data_is_read_one_record_at_a_time() {
+    let (client_config, server_config) = configs();
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    do_handshake(&mut client, &mut server);
+    let (mut client, mut server) = make_pair_for_arc_configs(&client_config, &server_config);
+    // Each write is a record of its own.
+    for record in [&b"abc"[..], b"defgh"] {
+        client
+            .early_data()
+            .expect("the session allows early data")
+            .write_all(record)
+            .unwrap();
+    }
+    do_handshake(&mut client, &mut server);
+    assert!(client.is_early_data_accepted());
+
+    let mut early = server
+        .early_data()
+        .expect("early data was accepted");
+    assert_eq!(early.fill_buf().unwrap(), b"abc");
+    early.consume(1);
+    // A partial consume keeps the rest of the record.
+    assert_eq!(early.fill_buf().unwrap(), b"bc");
+    early.consume(2);
+    assert_eq!(early.fill_buf().unwrap(), b"defgh");
+    early.consume(5);
+    assert_eq!(early.fill_buf().unwrap(), b"");
 }
