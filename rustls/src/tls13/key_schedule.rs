@@ -463,6 +463,7 @@ impl KeyScheduleClientBeforeFinished {
         common: &mut CommonState,
         hs_hash: hash::Output,
     ) -> (KeyScheduleTraffic, KeyScheduleResumption) {
+        // FAIM: the decrypter here, the rest in `into_traffic_reading`.
         self.0
             .ks
             .set_decrypter(&self.0.current_server_traffic_secret, common);
@@ -700,6 +701,7 @@ impl KeySchedule {
     /// 0-value consisting of a string of Hash.length bytes set
     /// to zeros is used."
     fn input_empty(&mut self) {
+        // FAIM: through `after_empty_input`, which a held client also derives from.
         self.current = self.after_empty_input();
     }
 

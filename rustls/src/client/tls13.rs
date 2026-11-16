@@ -1468,6 +1468,10 @@ impl State<ClientConnectionData> for ExpectFinished {
     }
 }
 
+/// FAIM: how many tickets a client holding its early data keeps until its `Finished`;
+/// a server sends a few, and the rest are dropped.
+const HELD_TICKETS: usize = 8;
+
 /// FAIM: a handshake held open past the server's `Finished`, until
 /// `ClientConnection::end_early_data`. What is written goes out as early data meanwhile,
 /// and what the server sends behind its `Finished` is read under its traffic keys.
@@ -1497,7 +1501,10 @@ impl State<ClientConnectionData> for HoldingEarlyData {
                 ..
             }
         ) {
-            self.tickets.push(m.into_owned());
+            // As a server flooding a client with tickets is met past the store's capacity.
+            if self.tickets.len() < HELD_TICKETS {
+                self.tickets.push(m.into_owned());
+            }
             return Ok(self);
         }
         // Nothing else the server sends needs an answer before the client's `Finished`.
@@ -1640,7 +1647,10 @@ impl ExpectFinished {
             .remove_tls12_session(&st.server_name);
 
         /* Now move to our application traffic keys. */
-        cx.common.check_aligned_handshake()?;
+        // FAIM: a held client's decrypter moved when the hold began, and was checked then.
+        if server_traffic == ServerTraffic::Unread {
+            cx.common.check_aligned_handshake()?;
+        }
         let hash_after_finished = st.transcript.current_hash();
         let (key_schedule, resumption) = match server_traffic {
             ServerTraffic::Unread => {
