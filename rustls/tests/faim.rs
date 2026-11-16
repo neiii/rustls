@@ -1,16 +1,22 @@
 //! FAIM: resumption through a hello template, tickets issued after the handshake, and
-//! early data held open past the server's `Finished` (faim-http#199), and early data read
-//! one record at a time (faim-http#498).
+//! early data held open past the server's `Finished` (faim-http#199), early data read
+//! one record at a time (faim-http#498), and what the server sends behind its `Finished`
+//! read while early data is held (faim-http#564).
 
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
 use std::io::{BufRead, Read, Write};
+use std::sync::Mutex;
 
 use faim_template::{ClientHello, ClientTemplate};
 use rustls::client::{ClientSessionMemoryCache, Resumption};
+use rustls::crypto::cipher::{OutboundChunks, OutboundPlainMessage};
+use rustls::crypto::tls13::OkmBlock;
+use rustls::internal::{derive_traffic_iv, derive_traffic_key};
 use rustls::server::ServerSessionMemoryCache;
 use rustls::{
-    ClientConfig, ClientConnection, Error, HandshakeKind, ServerConfig, ServerConnection,
+    ClientConfig, ClientConnection, ContentType, Error, HandshakeKind, KeyLog, ProtocolVersion,
+    ServerConfig, ServerConnection, SupportedCipherSuite,
 };
 
 use super::*;
@@ -206,8 +212,9 @@ fn what_doesnt_fit_a_held_handshakes_early_data_goes_out_after_it_ends() {
     assert_eq!(rest, vec![7; 66]);
 }
 
-#[test]
-fn what_a_server_writes_before_a_held_handshake_ends_is_read_once_it_ends() {
+/// A client and a server that sends half-RTT data, run to the point the client holds its
+/// early data open, with the server's `half rtt` behind its `Finished`.
+fn hold_behind_half_rtt_data() -> (ClientConnection, ServerConnection) {
     let (client, server) = configs();
     let config = holding_config(&client, &server);
     let mut halfway = (*server).clone();
@@ -217,22 +224,75 @@ fn what_a_server_writes_before_a_held_handshake_ends_is_read_once_it_ends() {
         .writer()
         .write_all(b"half rtt")
         .unwrap();
-
     transfer(&mut client, &mut server);
     server.process_new_packets().unwrap();
     transfer(&mut server, &mut client);
     client.process_new_packets().unwrap();
-    // A read loop goes on processing while held, and the bytes behind `Finished` wait.
-    client.process_new_packets().unwrap();
+    (client, server)
+}
+
+#[test]
+fn what_a_server_writes_behind_its_finished_is_read_while_early_data_is_held() {
+    let (mut client, _server) = hold_behind_half_rtt_data();
 
     assert!(client.early_data_held());
-    client.end_early_data().unwrap();
     let mut read = vec![0; 8];
     client
         .reader()
         .read_exact(&mut read)
         .unwrap();
     assert_eq!(read, b"half rtt");
+    assert!(client.early_data_held());
+}
+
+#[test]
+fn after_reading_half_rtt_data_while_held_traffic_flows_both_ways() {
+    let (mut client, mut server) = hold_behind_half_rtt_data();
+    let mut read = vec![0; 8];
+    client
+        .reader()
+        .read_exact(&mut read)
+        .unwrap();
+
+    client
+        .writer()
+        .write_all(b"early")
+        .unwrap();
+    client.end_early_data().unwrap();
+    client
+        .writer()
+        .write_all(b"late")
+        .unwrap();
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    server
+        .writer()
+        .write_all(b"answer")
+        .unwrap();
+    transfer(&mut server, &mut client);
+    client.process_new_packets().unwrap();
+
+    let mut early = Vec::new();
+    server
+        .early_data()
+        .unwrap()
+        .read_to_end(&mut early)
+        .unwrap();
+    assert_eq!(early, b"early");
+    let mut late = vec![0; 4];
+    server
+        .reader()
+        .read_exact(&mut late)
+        .unwrap();
+    assert_eq!(late, b"late");
+    let mut answer = vec![0; 6];
+    client
+        .reader()
+        .read_exact(&mut answer)
+        .unwrap();
+    assert_eq!(answer, b"answer");
+    // The server's tickets, sent after the client's `Finished`, are good ones.
+    assert_eq!(client.tls13_tickets_received(), 2);
 }
 
 #[test]
@@ -271,6 +331,94 @@ fn what_was_written_before_the_hold_stays_ahead_of_what_is_written_during_it() {
         .read_exact(&mut read)
         .unwrap();
     assert_eq!(read, b"firstsecond");
+}
+
+/// Keeps the server's first application traffic secret.
+#[derive(Debug, Default)]
+struct ServerTrafficSecret(Mutex<Vec<u8>>);
+
+impl KeyLog for ServerTrafficSecret {
+    fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
+        if label == "SERVER_TRAFFIC_SECRET_0" {
+            *self.0.lock().unwrap() = secret.to_vec();
+        }
+    }
+}
+
+/// A `NewSessionTicket` record sealed under `secret` in `client`'s suite at sequence number
+/// `seq`: what BoringSSL sends behind its `Finished` when it accepts early data, which a
+/// rustls server never does.
+fn ticket_record(client: &ClientConnection, secret: &[u8], seq: u64) -> Vec<u8> {
+    let Some(SupportedCipherSuite::Tls13(suite)) = client.negotiated_cipher_suite() else {
+        panic!("TLS 1.3");
+    };
+    let expander = suite
+        .hkdf_provider
+        .expander_for_okm(&OkmBlock::new(secret));
+    let key = derive_traffic_key(expander.as_ref(), suite.aead_alg);
+    let iv = derive_traffic_iv(expander.as_ref());
+    let mut body = 7200_u32.to_be_bytes().to_vec(); // ticket_lifetime
+    body.extend_from_slice(&[0; 4]); // ticket_age_add
+    body.extend_from_slice(&[1, 0]); // ticket_nonce
+    body.extend_from_slice(&[0, 4]);
+    body.extend_from_slice(b"tckt");
+    body.extend_from_slice(&[0, 0]); // no extensions
+    let mut message = vec![4]; // new_session_ticket
+    message.extend_from_slice(
+        &u32::try_from(body.len())
+            .unwrap()
+            .to_be_bytes()[1..],
+    );
+    message.extend_from_slice(&body);
+    let chunks = [message.as_slice()];
+    let plain = OutboundPlainMessage {
+        typ: ContentType::Handshake,
+        version: ProtocolVersion::TLSv1_2,
+        payload: OutboundChunks::new(&chunks),
+    };
+    suite
+        .aead_alg
+        .encrypter(key, iv)
+        .encrypt(plain, seq)
+        .unwrap()
+        .encode()
+}
+
+#[test]
+fn a_ticket_sent_before_a_held_clients_finished_is_taken_once_early_data_ends() {
+    let (client, server) = configs();
+    let config = holding_config(&client, &server);
+    let secret = Arc::new(ServerTrafficSecret::default());
+    let mut halfway = (*server).clone();
+    halfway.send_half_rtt_data = true;
+    halfway.key_log = secret.clone();
+    let (mut client, mut server) = make_pair_for_arc_configs(&config, &Arc::new(halfway));
+    server
+        .writer()
+        .write_all(b"half rtt")
+        .unwrap();
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    transfer(&mut server, &mut client);
+    client.process_new_packets().unwrap();
+    // The half-RTT data took sequence number 0.
+    let record = ticket_record(&client, &secret.0.lock().unwrap(), 1);
+    client
+        .read_tls(&mut record.as_slice())
+        .unwrap();
+    client.process_new_packets().unwrap();
+
+    assert!(client.early_data_held());
+    assert_eq!(client.tls13_tickets_received(), 0);
+    client.end_early_data().unwrap();
+
+    assert_eq!(client.tls13_tickets_received(), 1);
+    let mut read = vec![0; 8];
+    client
+        .reader()
+        .read_exact(&mut read)
+        .unwrap();
+    assert_eq!(read, b"half rtt");
 }
 
 #[test]
