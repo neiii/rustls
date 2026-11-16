@@ -633,7 +633,8 @@ mod connection {
     ///
     /// "Early data" is also known as "0-RTT data".
     ///
-    /// This structure implements [`std::io::Read`].
+    /// This structure implements [`std::io::Read`], and (FAIM) [`std::io::BufRead`] one
+    /// record at a time.
     pub struct ReadEarlyData<'a> {
         early_data: &'a mut EarlyDataState,
     }
@@ -652,6 +653,26 @@ mod connection {
         #[cfg(read_buf)]
         fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_, u8>) -> io::Result<()> {
             self.early_data.read_buf(cursor)
+        }
+    }
+
+    // FAIM: early data one record at a time, as `impl BufRead for Reader` reads what follows
+    // the handshake. Each record received appends a chunk of its own, so the end of what
+    // `fill_buf` returns is where one of the client's records ended, which FAIM copies
+    // toward the server (faim-http#449, faim-http#498).
+    impl io::BufRead for ReadEarlyData<'_> {
+        /// The rest of the first early data record not yet consumed, empty once all of it
+        /// has been.
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.early_data.fill_buf()
+        }
+
+        /// # Panics
+        ///
+        /// When `amt` is more than the last `fill_buf` returned, as
+        /// [`Reader`](crate::Reader)'s does.
+        fn consume(&mut self, amt: usize) {
+            self.early_data.consume(amt);
         }
     }
 
@@ -1225,6 +1246,23 @@ impl EarlyDataState {
         match self {
             Self::Accepted { received, .. } => received.read_buf(cursor),
             _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        }
+    }
+
+    /// FAIM: the rest of the first record's chunk (faim-http#498).
+    #[cfg(feature = "std")]
+    fn fill_buf(&self) -> io::Result<&[u8]> {
+        match self {
+            Self::Accepted { received, .. } => Ok(received.chunk().unwrap_or_default()),
+            _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+        }
+    }
+
+    /// FAIM: consumes `amt` bytes of the first record's chunk (faim-http#498).
+    #[cfg(feature = "std")]
+    fn consume(&mut self, amt: usize) {
+        if let Self::Accepted { received, .. } = self {
+            received.consume_first_chunk(amt);
         }
     }
 
