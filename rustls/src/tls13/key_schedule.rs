@@ -974,6 +974,22 @@ fn hkdf_expand_label_slice(
     })
 }
 
+/// FAIM: a server's ECH `accept_confirmation`, for the end of its `ServerHello`'s
+/// random (RFC 9849 §7.2), where the client's key schedule isn't at hand.
+pub(crate) fn server_ech_accept_confirmation(
+    hkdf_provider: &'static dyn Hkdf,
+    client_hello_inner_random: &[u8],
+    hs_hash: hash::Output,
+) -> [u8; 8] {
+    hkdf_expand_label(
+        hkdf_provider
+            .extract_from_secret(None, client_hello_inner_random)
+            .as_ref(),
+        SecretKind::ServerEchConfirmationSecret.to_bytes(),
+        hs_hash.as_ref(),
+    )
+}
+
 pub(crate) fn server_ech_hrr_confirmation_secret(
     hkdf_provider: &'static dyn Hkdf,
     client_hello_inner_random: &[u8],

@@ -253,6 +253,8 @@ pub enum PeerMisbehaved {
     EarlyDataExtensionWithoutResumption,
     EarlyDataOfferedWithVariedCipherSuite,
     EchAcceptanceVariedAfterRetry,
+    /// FAIM: a second `ClientHello` whose ECH doesn't open, after the first one's did.
+    EchNotOpenedAfterRetry,
     HandshakeHashVariedAfterRetry,
     IllegalHelloRetryRequestWithEmptyCookie,
     IllegalHelloRetryRequestWithNoChanges,
