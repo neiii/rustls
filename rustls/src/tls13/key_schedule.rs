@@ -338,6 +338,27 @@ impl KeyScheduleHandshake {
         }
     }
 
+    /// FAIM: moves the decrypter to the server's application traffic secret, derived from
+    /// `pre_finished_hash` (the transcript through the server's `Finished`) as
+    /// [`Self::into_pre_finished_client_traffic`] derives it, without moving the key
+    /// schedule on. A client holding its early data open (`ClientConfig::hold_early_data`)
+    /// then reads what the server sends behind its `Finished` before its own flight goes,
+    /// and [`KeyScheduleClientBeforeFinished::into_traffic_reading`] leaves the decrypter be.
+    pub(crate) fn set_server_traffic_decrypter(
+        &self,
+        pre_finished_hash: &hash::Output,
+        common: &mut CommonState,
+    ) {
+        debug_assert_eq!(common.side, Side::Client);
+        let master = self.ks.after_empty_input();
+        let secret = hkdf_expand_label_block(
+            master.as_ref(),
+            SecretKind::ServerApplicationTrafficSecret.to_bytes(),
+            pre_finished_hash.as_ref(),
+        );
+        self.ks.set_decrypter(&secret, common);
+    }
+
     pub(crate) fn into_pre_finished_client_traffic(
         self,
         pre_finished_hash: hash::Output,
@@ -442,6 +463,20 @@ impl KeyScheduleClientBeforeFinished {
         common: &mut CommonState,
         hs_hash: hash::Output,
     ) -> (KeyScheduleTraffic, KeyScheduleResumption) {
+        self.0
+            .ks
+            .set_decrypter(&self.0.current_server_traffic_secret, common);
+        self.into_traffic_reading(common, hs_hash)
+    }
+
+    /// FAIM: [`Self::into_traffic`] for a client whose decrypter already reads the server's
+    /// traffic ([`KeyScheduleHandshake::set_server_traffic_decrypter`]). Only the encrypter
+    /// moves, so the records the server sent behind its `Finished` keep their sequence.
+    pub(crate) fn into_traffic_reading(
+        self,
+        common: &mut CommonState,
+        hs_hash: hash::Output,
+    ) -> (KeyScheduleTraffic, KeyScheduleResumption) {
         let next = self.0;
 
         debug_assert_eq!(common.side, Side::Client);
@@ -450,8 +485,6 @@ impl KeyScheduleClientBeforeFinished {
             &next.current_server_traffic_secret,
         );
 
-        next.ks
-            .set_decrypter(server_secret, common);
         next.ks
             .set_encrypter(client_secret, common);
 
@@ -667,11 +700,15 @@ impl KeySchedule {
     /// 0-value consisting of a string of Hash.length bytes set
     /// to zeros is used."
     fn input_empty(&mut self) {
+        self.current = self.after_empty_input();
+    }
+
+    /// FAIM: the secret [`Self::input_empty`] moves to, leaving this one as it is.
+    fn after_empty_input(&self) -> Box<dyn HkdfExpander> {
         let salt = self.derive_for_empty_hash(SecretKind::DerivedSecret);
-        self.current = self
-            .suite
+        self.suite
             .hkdf_provider
-            .extract_from_zero_ikm(Some(salt.as_ref()));
+            .extract_from_zero_ikm(Some(salt.as_ref()))
     }
 
     /// Input the given secret.

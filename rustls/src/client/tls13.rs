@@ -1445,16 +1445,22 @@ impl State<ClientConnectionData> for ExpectFinished {
         let hash_after_handshake = st.transcript.current_hash();
 
         // FAIM: faim-http ends early data once its client's handshake with it completes.
+        // Meanwhile it reads what the server sends behind its `Finished` (faim-http#564).
         if cx.common.early_traffic && st.config.hold_early_data {
+            cx.common.check_aligned_handshake()?;
+            st.key_schedule
+                .set_server_traffic_decrypter(&hash_after_handshake, cx.common);
+            cx.common.may_receive_application_data = true;
             cx.common.early_data_held = Some(cx.data.early_data.bytes_left());
             return Ok(Box::new(HoldingEarlyData {
                 finished: st,
                 hash_after_handshake,
                 fin,
+                tickets: Vec::new(),
             }));
         }
 
-        st.finish(cx, hash_after_handshake, fin)
+        st.finish(cx, hash_after_handshake, fin, ServerTraffic::Unread)
     }
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
@@ -1463,24 +1469,50 @@ impl State<ClientConnectionData> for ExpectFinished {
 }
 
 /// FAIM: a handshake held open past the server's `Finished`, until
-/// `ClientConnection::end_early_data`. What is written goes out as early data meanwhile.
+/// `ClientConnection::end_early_data`. What is written goes out as early data meanwhile,
+/// and what the server sends behind its `Finished` is read under its traffic keys.
 struct HoldingEarlyData {
     finished: ExpectFinished,
     hash_after_handshake: hash::Output,
     fin: verify::FinishedMessageVerified,
+    /// Tickets the server sent before the client's `Finished`, as BoringSSL does when it
+    /// accepts early data. Their resumption secret needs that `Finished`, so they wait for
+    /// it.
+    tickets: Vec<Message<'static>>,
 }
 
 impl State<ClientConnectionData> for HoldingEarlyData {
     fn handle<'m>(
-        self: Box<Self>,
-        _cx: &mut ClientContext<'_>,
+        mut self: Box<Self>,
+        cx: &mut ClientContext<'_>,
         m: Message<'m>,
     ) -> hs::NextStateOrError<'m>
     where
         Self: 'm,
     {
-        // The server sends nothing that needs an answer before FAIM's `Finished`.
-        Err(crate::check::inappropriate_message(&m.payload, &[]))
+        if matches!(
+            m.payload,
+            MessagePayload::Handshake {
+                parsed: HandshakeMessagePayload(HandshakePayload::NewSessionTicketTls13(_)),
+                ..
+            }
+        ) {
+            self.tickets.push(m.into_owned());
+            return Ok(self);
+        }
+        // Nothing else the server sends needs an answer before the client's `Finished`.
+        match m.payload {
+            MessagePayload::ApplicationData(payload) => {
+                cx.common
+                    .take_received_plaintext(payload);
+                Ok(self)
+            }
+            payload => Err(inappropriate_handshake_message(
+                &payload,
+                &[ContentType::ApplicationData, ContentType::Handshake],
+                &[HandshakeType::NewSessionTicket],
+            )),
+        }
     }
 
     fn end_early_data(
@@ -1492,13 +1524,27 @@ impl State<ClientConnectionData> for HoldingEarlyData {
             finished,
             hash_after_handshake,
             fin,
+            tickets,
         } = *self;
-        finished.finish(cx, hash_after_handshake, fin)
+        let mut state = finished.finish(cx, hash_after_handshake, fin, ServerTraffic::Read)?;
+        for ticket in tickets {
+            state = state.handle(cx, ticket)?;
+        }
+        Ok(state)
     }
 
     fn into_owned(self: Box<Self>) -> hs::NextState<'static> {
         self
     }
+}
+
+/// FAIM: whether the server's traffic keys were read before the client's `Finished`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerTraffic {
+    /// Not yet: the decrypter moves to them with the encrypter.
+    Unread,
+    /// Already, while early data was held, so the decrypter stays where it is.
+    Read,
 }
 
 impl ExpectFinished {
@@ -1509,6 +1555,7 @@ impl ExpectFinished {
         cx: &mut ClientContext<'_>,
         hash_after_handshake: hash::Output,
         fin: verify::FinishedMessageVerified,
+        server_traffic: ServerTraffic,
     ) -> hs::NextStateOrError<'static> {
         let mut st = self;
         /* The EndOfEarlyData message to server is still encrypted with early data keys,
@@ -1594,8 +1641,15 @@ impl ExpectFinished {
 
         /* Now move to our application traffic keys. */
         cx.common.check_aligned_handshake()?;
-        let (key_schedule, resumption) =
-            key_schedule_pre_finished.into_traffic(cx.common, st.transcript.current_hash());
+        let hash_after_finished = st.transcript.current_hash();
+        let (key_schedule, resumption) = match server_traffic {
+            ServerTraffic::Unread => {
+                key_schedule_pre_finished.into_traffic(cx.common, hash_after_finished)
+            }
+            ServerTraffic::Read => {
+                key_schedule_pre_finished.into_traffic_reading(cx.common, hash_after_finished)
+            }
+        };
 
         // Now that we've reached the end of the normal handshake we must enforce ECH acceptance by
         // sending an alert and returning an error (potentially with retry configs) if the server

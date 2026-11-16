@@ -581,9 +581,7 @@ impl<Data> ConnectionCommon<Data> {
     /// FAIM: ends the early data this connection holds open (`ClientConfig::hold_early_data`).
     pub(crate) fn end_early_data(&mut self) -> Result<(), Error> {
         self.core
-            .end_early_data(&mut self.sendable_plaintext)?;
-        // What arrived while it was held, which the traffic keys can now read.
-        self.process_new_packets().map(drop)
+            .end_early_data(&mut self.sendable_plaintext)
     }
 
     /// Returns an object that allows reading plaintext.
@@ -916,17 +914,6 @@ impl<Data> ConnectionCore<Data> {
         deframer_buffer: &mut DeframerVecBuffer,
         sendable_plaintext: &mut ChunkVecBuffer,
     ) -> Result<IoState, Error> {
-        // FAIM: while early data is held open, what has come in stays buffered: the
-        // decrypter is on the handshake keys, and the server may have written under its
-        // traffic keys. `end_early_data` processes it.
-        if self
-            .common_state
-            .early_data_held
-            .is_some()
-        {
-            return Ok(self.common_state.current_io_state());
-        }
-
         let mut state = match mem::replace(&mut self.state, Err(Error::HandshakeNotComplete)) {
             Ok(state) => state,
             Err(e) => {
@@ -964,17 +951,6 @@ impl<Data> ConnectionCore<Data> {
                     deframer_buffer.discard(buffer_progress.take_discard());
                     return Err(e);
                 }
-            }
-
-            // FAIM: a server may write under its traffic keys before the client's `Finished`,
-            // and the decrypter moves to them only once early data ends. What came with the
-            // server's `Finished` waits in the buffer until `end_early_data`.
-            if self
-                .common_state
-                .early_data_held
-                .is_some()
-            {
-                break;
             }
 
             if self
