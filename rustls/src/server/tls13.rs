@@ -23,7 +23,7 @@ use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::KeyUpdateRequest;
 use crate::msgs::handshake::{
     CERTIFICATE_MAX_SIZE_LIMIT, CertificateChain, CertificatePayloadTls13, EchConfigPayload,
-    HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayloadTls13,
+    EncryptedClientHello, HandshakeMessagePayload, HandshakePayload, NewSessionTicketPayloadTls13,
     ServerEncryptedClientHello,
 };
 use crate::msgs::message::{Message, MessagePayload};
@@ -54,10 +54,12 @@ mod client_hello {
         SessionId,
     };
     use crate::server::common::ActiveCertifiedKey;
+    use crate::server::ech;
     use crate::server::hs::PreviousClientHello;
     use crate::sign;
     use crate::tls13::key_schedule::{
         KeyScheduleEarly, KeyScheduleHandshake, KeySchedulePreHandshake,
+        server_ech_accept_confirmation, server_ech_hrr_confirmation_secret,
     };
     use crate::verify::DigitallySignedStruct;
 
@@ -78,6 +80,9 @@ mod client_hello {
         pub(in crate::server) extra_exts: ServerExtensionsInput<'static>,
         /// FAIM: the server template's answer, if one answers this client.
         pub(in crate::server) answer: Option<faim_template::Answer>,
+        /// FAIM: the client's ECH, when the server accepted it and the hello being
+        /// handled is the inner one (faim-http#600).
+        pub(in crate::server) ech: Option<ech::Accepting>,
     }
 
     fn max_early_data_size(configured: u32) -> usize {
@@ -250,6 +255,9 @@ mod client_hello {
                     client_hello.session_id,
                     cx.common,
                     selected_kxg.name(),
+                    self.ech
+                        .is_some()
+                        .then_some(&self.randoms.client),
                 );
                 emit_fake_ccs(cx.common);
 
@@ -270,6 +278,7 @@ mod client_hello {
                     }),
                     send_tickets: self.send_tickets,
                     extra_exts: self.extra_exts,
+                    ech: self.ech,
                 });
 
                 return if early_data_requested {
@@ -420,6 +429,9 @@ mod client_hello {
                     .map(|x| &x.master_secret.0[..]),
                 &self.config,
                 self.answer.as_ref(),
+                self.ech
+                    .is_some()
+                    .then_some(&self.randoms.client),
             )?;
             if !self.previous_hello.is_some() {
                 emit_fake_ccs(cx.common);
@@ -570,6 +582,7 @@ mod client_hello {
         resuming_psk: Option<&[u8]>,
         config: &ServerConfig,
         answer: Option<&faim_template::Answer>,
+        ech_inner_random: Option<&[u8; 32]>,
     ) -> Result<KeyScheduleHandshake, Error> {
         // Prepare key exchange; the caller already found the matching SupportedKxGroup
         let (share, kxgroup) = share_and_kxgroup;
@@ -582,40 +595,59 @@ mod client_hello {
             })?;
         cx.common.kx_state.complete();
 
-        let sh = match answer {
-            // FAIM: the server template's `ServerHello`, as it renders.
-            Some(answer) => Message {
-                version: template::record_version(answer),
-                payload: MessagePayload::handshake(template::server_hello(
-                    answer,
-                    randoms.server,
-                    session_id.as_ref(),
-                    suite.common.suite,
-                    Some((ckx.group, &ckx.pub_key)),
-                    chosen_psk_idx.map(|idx| idx as u16),
-                )?),
-            },
-            None => {
-                let extensions = Box::new(ServerExtensions {
-                    key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key)),
-                    selected_version: Some(ProtocolVersion::TLSv1_3),
-                    preshared_key: chosen_psk_idx.map(|idx| idx as u16),
-                    ..Default::default()
-                });
-                Message {
-                    version: ProtocolVersion::TLSv1_2,
-                    payload: MessagePayload::handshake(HandshakeMessagePayload(
-                        HandshakePayload::ServerHello(ServerHelloPayload {
-                            legacy_version: ProtocolVersion::TLSv1_2,
-                            random: Random::from(randoms.server),
-                            session_id: *session_id,
-                            cipher_suite: suite.common.suite,
-                            compression_method: Compression::Null,
-                            extensions,
-                        }),
-                    )),
+        let server_hello = |random: [u8; 32]| -> Result<Message<'static>, Error> {
+            Ok(match answer {
+                // FAIM: the server template's `ServerHello`, as it renders.
+                Some(answer) => Message {
+                    version: template::record_version(answer),
+                    payload: MessagePayload::handshake(template::server_hello(
+                        answer,
+                        random,
+                        session_id.as_ref(),
+                        suite.common.suite,
+                        Some((ckx.group, &ckx.pub_key)),
+                        chosen_psk_idx.map(|idx| idx as u16),
+                    )?),
+                },
+                None => {
+                    let extensions = Box::new(ServerExtensions {
+                        key_share: Some(KeyShareEntry::new(ckx.group, ckx.pub_key.clone())),
+                        selected_version: Some(ProtocolVersion::TLSv1_3),
+                        preshared_key: chosen_psk_idx.map(|idx| idx as u16),
+                        ..Default::default()
+                    });
+                    Message {
+                        version: ProtocolVersion::TLSv1_2,
+                        payload: MessagePayload::handshake(HandshakeMessagePayload(
+                            HandshakePayload::ServerHello(ServerHelloPayload {
+                                legacy_version: ProtocolVersion::TLSv1_2,
+                                random: Random::from(random),
+                                session_id: *session_id,
+                                cipher_suite: suite.common.suite,
+                                compression_method: Compression::Null,
+                                extensions,
+                            }),
+                        )),
+                    }
                 }
-            }
+            })
+        };
+        // FAIM: `ech_inner_random`, the inner hello's random when the server accepted
+        // the client's ECH, ends the random with the acceptance confirmation, computed
+        // over the `ServerHello` with those bytes zeroed (RFC 9849 §7.2).
+        let sh = if let Some(inner_random) = ech_inner_random {
+            let mut random = randoms.server;
+            random[24..].fill(0);
+            let mut confirming = transcript.clone();
+            confirming.add_message(&server_hello(random)?);
+            random[24..].copy_from_slice(&server_ech_accept_confirmation(
+                suite.hkdf_provider,
+                inner_random,
+                confirming.current_hash(),
+            ));
+            server_hello(random)?
+        } else {
+            server_hello(randoms.server)?
         };
 
         cx.common.check_aligned_handshake()?;
@@ -666,33 +698,50 @@ mod client_hello {
         common.send_msg(m, false);
     }
 
+    /// FAIM: `ech_inner_random`, the inner hello's random when the server accepted the
+    /// client's ECH, puts the acceptance signal in the request (RFC 9849 §7.2.1).
     fn emit_hello_retry_request(
         transcript: &mut HandshakeHash,
         suite: &'static Tls13CipherSuite,
         session_id: SessionId,
         common: &mut CommonState,
         group: NamedGroup,
+        ech_inner_random: Option<&[u8; 32]>,
     ) {
-        let req = HelloRetryRequest {
-            legacy_version: ProtocolVersion::TLSv1_2,
-            session_id,
-            cipher_suite: suite.common.suite,
-            extensions: HelloRetryRequestExtensions {
-                key_share: Some(group),
-                supported_versions: Some(ProtocolVersion::TLSv1_3),
-                ..Default::default()
-            },
-        };
-
-        let m = Message {
+        let request = |encrypted_client_hello: Option<Vec<u8>>| Message {
             version: ProtocolVersion::TLSv1_2,
             payload: MessagePayload::handshake(HandshakeMessagePayload(
-                HandshakePayload::HelloRetryRequest(req),
+                HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                    legacy_version: ProtocolVersion::TLSv1_2,
+                    session_id,
+                    cipher_suite: suite.common.suite,
+                    extensions: HelloRetryRequestExtensions {
+                        key_share: Some(group),
+                        supported_versions: Some(ProtocolVersion::TLSv1_3),
+                        encrypted_client_hello: encrypted_client_hello.map(Payload::new),
+                        ..Default::default()
+                    },
+                }),
             )),
         };
 
-        trace!("Requesting retry {m:?}");
         transcript.rollup_for_hrr();
+        let m = match ech_inner_random {
+            // The confirmation is computed over the request with zeros in its place.
+            Some(inner_random) => {
+                let mut confirming = transcript.clone();
+                confirming.add_message(&request(Some(vec![0; 8])));
+                let confirmation = server_ech_hrr_confirmation_secret(
+                    suite.hkdf_provider,
+                    inner_random,
+                    confirming.current_hash(),
+                );
+                request(Some(confirmation.to_vec()))
+            }
+            None => request(None),
+        };
+
+        trace!("Requesting retry {m:?}");
         transcript.add_message(&m);
         common.send_msg(m, false);
         common.handshake_kind = Some(HandshakeKind::FullWithHelloRetryRequest);
@@ -825,7 +874,8 @@ mod client_hello {
         // accepts (RFC 9849 §7.1). Configs that don't parse, or parse to an empty list
         // the extension doesn't allow, are left out: ServerHello has gone out, and the
         // client is answered the same way without them.
-        if let (Some(configs), Some(_)) = (&config.ech_retry_configs, &hello.encrypted_client_hello)
+        if let (Some(configs), Some(EncryptedClientHello::Outer(_))) =
+            (&config.ech_retry_configs, &hello.encrypted_client_hello)
         {
             match Vec::<EchConfigPayload>::read(&mut Reader::init(configs)) {
                 Ok(retry_configs) if !retry_configs.is_empty() => {

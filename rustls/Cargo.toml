@@ -85,6 +85,10 @@ name = "faim"
 path = "tests/runners/faim.rs"
 
 [[test]]
+name = "faim_ech"
+path = "tests/runners/faim_ech.rs"
+
+[[test]]
 name = "api_ffdhe"
 path = "tests/runners/api_ffdhe.rs"
 required-features = ["tls12"]

@@ -21,14 +21,14 @@ use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 #[cfg(feature = "tls12")]
 use crate::msgs::handshake::SessionId;
 use crate::msgs::handshake::{
-    ClientHelloPayload, HandshakePayload, KeyExchangeAlgorithm, ProtocolName, Random,
-    ServerExtensions, ServerExtensionsInput, ServerNamePayload, SingleProtocolName,
+    ClientHelloPayload, EncryptedClientHello, HandshakePayload, KeyExchangeAlgorithm, ProtocolName,
+    Random, ServerExtensions, ServerExtensionsInput, ServerNamePayload, SingleProtocolName,
     TransportParameters,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::server::common::ActiveCertifiedKey;
-use crate::server::{ClientHello, ServerConfig, template, tls13};
+use crate::server::{ClientHello, ServerConfig, ech, template, tls13};
 use crate::sync::Arc;
 use crate::{SupportedCipherSuite, suites};
 
@@ -315,6 +315,9 @@ pub(super) struct ExpectClientHello {
     pub(super) using_ems: bool,
     pub(super) previous_hello: Option<PreviousClientHello>,
     pub(super) send_tickets: usize,
+    /// FAIM: the ECH accepted on the first hello, which opens the second
+    /// (faim-http#600).
+    pub(super) ech: Option<ech::Accepting>,
 }
 
 impl ExpectClientHello {
@@ -338,11 +341,68 @@ impl ExpectClientHello {
             using_ems: false,
             previous_hello: None,
             send_tickets: 0,
+            ech: None,
         }
     }
 
     /// Continues handling of a `ClientHello` message once config and certificate are available.
+    ///
+    /// FAIM: a first hello whose ECH one of the config's keys opens is handled as its
+    /// inner hello from here on (faim-http#600).
     pub(super) fn with_certified_key(
+        mut self,
+        sig_schemes: Vec<SignatureScheme>,
+        client_hello: &ClientHelloPayload,
+        m: &Message<'_>,
+        cx: &mut ServerContext<'_>,
+    ) -> NextStateOrError<'static> {
+        let opened = match self.previous_hello {
+            None => ech::open(m, &self.config.ech_keys),
+            // A first hello's ECH that wasn't accepted stays rejected.
+            Some(_) => None,
+        };
+        let Some((opened, accepting)) = opened else {
+            return self.with_hello(sig_schemes, client_hello, m, cx);
+        };
+        self.ech = Some(accepting);
+        // The SNI the handshake goes on with is the inner hello's.
+        cx.data.sni = None;
+        self.with_inner_hello(opened.inner_hello(), cx)
+    }
+
+    /// FAIM: handles `inner_hello`, an inner `ClientHello` opened from the client's ECH.
+    fn with_inner_hello(
+        self,
+        inner_hello: &[u8],
+        cx: &mut ServerContext<'_>,
+    ) -> NextStateOrError<'static> {
+        let inner = ech::inner_message(inner_hello).map_err(|error| {
+            cx.common
+                .send_fatal_alert(AlertDescription::DecodeError, error)
+        })?;
+        let (client_hello, sig_schemes) =
+            process_client_hello(&inner, self.previous_hello.is_some(), cx)?;
+        // An inner hello says it is one, and offers TLS 1.3 alone (RFC 9849 §7.1).
+        let is_inner = matches!(
+            client_hello.encrypted_client_hello,
+            Some(EncryptedClientHello::Inner)
+        );
+        let tls13_alone = client_hello
+            .supported_versions
+            .as_ref()
+            .is_some_and(|versions| versions.tls13 && !versions.tls12);
+        if !is_inner || !tls13_alone {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::IllegalParameter,
+                PeerMisbehaved::IllegalEchInnerHello,
+            ));
+        }
+        self.with_hello(sig_schemes, client_hello, &inner, cx)
+    }
+
+    /// Handles `client_hello`, the hello the handshake runs on. FAIM: upstream's
+    /// `with_certified_key`, renamed so an opened ECH runs it on the inner hello.
+    fn with_hello(
         self,
         mut sig_schemes: Vec<SignatureScheme>,
         client_hello: &ClientHelloPayload,
@@ -566,6 +626,7 @@ impl ExpectClientHello {
                 send_tickets: self.send_tickets,
                 extra_exts: self.extra_exts,
                 answer,
+                ech: self.ech,
             }
             .handle_client_hello(cx, certkey, m, client_hello, skxg, sig_schemes),
             #[cfg(feature = "tls12")]
@@ -735,9 +796,21 @@ impl State<ServerConnectionData> for ExpectClientHello {
     where
         Self: 'm,
     {
+        // FAIM: the second hello of a handshake that accepted the first's ECH is read as
+        // its inner hello, and one that doesn't open ends it (RFC 9849 §7.1.1).
+        let mut this = self;
+        if let Some(accepting) = &mut this.ech {
+            let inner_hello = accepting
+                .open_retry(&m)
+                .map_err(|alert| {
+                    cx.common
+                        .send_fatal_alert(alert, PeerMisbehaved::EchNotOpenedAfterRetry)
+                })?;
+            return this.with_inner_hello(&inner_hello, cx);
+        }
         let (client_hello, sig_schemes) =
-            process_client_hello(&m, self.previous_hello.is_some(), cx)?;
-        self.with_certified_key(sig_schemes, client_hello, &m, cx)
+            process_client_hello(&m, this.previous_hello.is_some(), cx)?;
+        this.with_certified_key(sig_schemes, client_hello, &m, cx)
     }
 
     fn into_owned(self: Box<Self>) -> NextState<'static> {

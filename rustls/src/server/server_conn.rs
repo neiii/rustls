@@ -465,6 +465,14 @@ pub struct ServerConfig {
     /// ignores them. `None` (the default) sends none.
     pub ech_retry_configs: Option<pki_types::EchConfigListBytes<'static>>,
 
+    /// FAIM: the ECH configs this server opens a client's ECH under, each with its
+    /// private key (faim-http#600). A first `ClientHello` one of them opens is answered
+    /// as its inner hello, with the acceptance signal in the `ServerHello`, and in a
+    /// `HelloRetryRequest` when one is needed (RFC 9849 §7.2). One that none opens is
+    /// answered as itself, with `ech_retry_configs` when the client offered ECH, as a
+    /// server that holds no keys answers it. Empty (the default) opens nothing.
+    pub ech_keys: Vec<Arc<super::EchServerKey>>,
+
     /// FAIM: the answer a real server gave, to answer the client with in its shape
     /// (faim-http#196): its version, suite and group where the fork completes them,
     /// and its `ServerHello` and `EncryptedExtensions` as it sent them, so the client
@@ -1147,6 +1155,22 @@ impl Accepted {
         Ok(ServerConnection {
             inner: self.connection,
         })
+    }
+
+    /// FAIM: opens the hello's ECH with the first of `keys` that opens it, before any
+    /// handshake, so the caller can still decide how to answer: with a config holding
+    /// that key, or not at all (faim-http#600). `None` when the hello carries no outer
+    /// ECH, or none of `keys` opens it, or it opens to something that isn't an inner
+    /// hello: a server reads each as GREASE, so none is an error.
+    pub fn open_ech(&self, keys: &[Arc<super::EchServerKey>]) -> Option<super::OpenedEch> {
+        super::ech::open(&self.message, keys).map(|(opened, _)| opened)
+    }
+
+    /// FAIM: the config id the hello's outer ECH names, which says which of the
+    /// server's configs to try on it; `None` when it carries no outer ECH
+    /// (faim-http#600).
+    pub fn ech_config_id(&self) -> Option<u8> {
+        super::ech::config_id(&self.message)
     }
 
     fn client_hello_payload<'a>(message: &'a Message<'_>) -> &'a ClientHelloPayload {

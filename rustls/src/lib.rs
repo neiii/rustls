@@ -626,6 +626,8 @@ pub use client::ClientConnection;
 pub mod server {
     pub(crate) mod builder;
     mod common;
+    // FAIM: opening a client's ECH with keys the server holds (faim-http#600).
+    mod ech;
     pub(crate) mod handy;
     mod hs;
     mod server_conn;
@@ -638,6 +640,7 @@ pub mod server {
     mod tls13;
 
     pub use builder::WantsServerCert;
+    pub use ech::{EchServerKey, OpenedEch};
     #[cfg(any(feature = "std", feature = "hashbrown"))]
     pub use handy::ResolvesServerCertUsingSni;
     #[cfg(any(feature = "std", feature = "hashbrown"))]
