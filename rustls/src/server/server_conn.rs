@@ -1166,6 +1166,13 @@ impl Accepted {
         super::ech::open(&self.message, keys).map(|(opened, _)| opened)
     }
 
+    /// FAIM: the config id the hello's outer ECH names, which says which of the
+    /// server's configs to try on it; `None` when it carries no outer ECH
+    /// (faim-http#600).
+    pub fn ech_config_id(&self) -> Option<u8> {
+        super::ech::config_id(&self.message)
+    }
+
     fn client_hello_payload<'a>(message: &'a Message<'_>) -> &'a ClientHelloPayload {
         match &message.payload {
             crate::msgs::message::MessagePayload::Handshake { parsed, .. } => match &parsed.0 {

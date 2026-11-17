@@ -255,6 +255,9 @@ pub enum PeerMisbehaved {
     EchAcceptanceVariedAfterRetry,
     /// FAIM: a second `ClientHello` whose ECH doesn't open, after the first one's did.
     EchNotOpenedAfterRetry,
+    /// FAIM: an opened inner `ClientHello` that doesn't say it is one, or offers a TLS
+    /// version below 1.3 (RFC 9849 §7.1).
+    IllegalEchInnerHello,
     HandshakeHashVariedAfterRetry,
     IllegalHelloRetryRequestWithEmptyCookie,
     IllegalHelloRetryRequestWithNoChanges,

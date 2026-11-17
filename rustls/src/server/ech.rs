@@ -19,21 +19,15 @@ use core::fmt;
 use core::ops::Range;
 
 use crate::crypto::hpke::{EncapsulatedSecret, Hpke, HpkeOpener, HpkePrivateKey};
-use crate::enums::{ContentType, ProtocolVersion};
+use crate::enums::{
+    AlertDescription, ContentType, EchClientHelloType, HandshakeType, ProtocolVersion,
+};
 use crate::error::{EncryptedClientHelloError, Error};
-use crate::msgs::codec::{Codec, Reader};
+use crate::msgs::codec::{Codec, Reader, u24};
+use crate::msgs::enums::ExtensionType;
 use crate::msgs::handshake::{EchConfigPayload, HpkeSymmetricCipherSuite};
 use crate::msgs::message::{Message, MessagePayload};
 use crate::sync::Arc;
-
-/// The handshake type of a `ClientHello`.
-const CLIENT_HELLO: u8 = 1;
-/// The `encrypted_client_hello` extension type.
-const ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
-/// The `ech_outer_extensions` extension type (RFC 9849 §5.1).
-const ECH_OUTER_EXTENSIONS: u16 = 0xfd00;
-/// The `ECHClientHello` type of an outer hello's extension.
-const OUTER: u8 = 0;
 
 /// FAIM: an ECH config a server opens a client's ECH under, with the private key of
 /// the config's public key.
@@ -186,19 +180,30 @@ pub(super) fn open(m: &Message<'_>, keys: &[Arc<EchServerKey>]) -> Option<(Opene
 
 impl Accepting {
     /// Opens the ECH of `m`, the second `ClientHello` of a handshake whose first ECH
-    /// this accepted, into its inner hello. `None` when it carries no outer ECH under
-    /// the same config and suite with an empty `enc`, or doesn't open, which the
-    /// handshake can't go on from (RFC 9849 §7.1.1).
-    pub(super) fn open_retry(&mut self, m: &Message<'_>) -> Option<Vec<u8>> {
-        let outer = Outer::read(handshake_bytes(m)?)?;
+    /// this accepted, into its inner hello, or the alert the handshake ends with where
+    /// it can't go on (RFC 9849 §7.1.1): `missing_extension` for a hello with no outer
+    /// ECH, `illegal_parameter` for one under another config or suite or with an
+    /// `enc`, and `decrypt_error` for one that doesn't open.
+    pub(super) fn open_retry(&mut self, m: &Message<'_>) -> Result<Vec<u8>, AlertDescription> {
+        let outer = handshake_bytes(m)
+            .and_then(Outer::read)
+            .ok_or(AlertDescription::MissingExtension)?;
         let same = outer.ech.config_id == self.config_id
             && outer.ech.cipher_suite == self.cipher_suite
             && outer.ech.enc.is_empty();
         if !same {
-            return None;
+            return Err(AlertDescription::IllegalParameter);
         }
-        outer.open_with(&mut *self.opener)
+        outer
+            .open_with(&mut *self.opener)
+            .ok_or(AlertDescription::DecryptError)
     }
+}
+
+/// The config id the outer ECH of `m`, a first `ClientHello`, names; `None` when it
+/// carries none.
+pub(super) fn config_id(m: &Message<'_>) -> Option<u8> {
+    Outer::read(handshake_bytes(m)?).map(|outer| outer.ech.config_id)
 }
 
 /// The encoded bytes of `m`, a handshake message.
@@ -239,7 +244,7 @@ struct Outer<'a> {
     /// Its session id, which the inner hello takes (RFC 9849 §5.1).
     session_id: &'a [u8],
     /// Its extensions, each whole: type, length and data.
-    extensions: Vec<(u16, &'a [u8])>,
+    extensions: Vec<(ExtensionType, &'a [u8])>,
     ech: OuterEch<'a>,
 }
 
@@ -248,10 +253,10 @@ impl<'a> Outer<'a> {
     /// when it isn't one, or carries no outer ECH.
     fn read(message: &'a [u8]) -> Option<Self> {
         let mut r = Reader::init(message);
-        if u8::read(&mut r).ok()? != CLIENT_HELLO {
+        if HandshakeType::read(&mut r).ok()? != HandshakeType::ClientHello {
             return None;
         }
-        let len = u24(&mut r)?;
+        let len = usize::from(u24::read(&mut r).ok()?);
         let body = r.take(len)?;
         if r.any_left() {
             return None;
@@ -271,10 +276,10 @@ impl<'a> Outer<'a> {
         let mut ech = None;
         while r.any_left() {
             let at = r.used();
-            let kind = u16::read(&mut r).ok()?;
+            let kind = ExtensionType::read(&mut r).ok()?;
             let data = prefixed16(&mut r)?;
             extensions.push((kind, all.get(at..r.used())?));
-            if kind == ENCRYPTED_CLIENT_HELLO {
+            if kind == ExtensionType::EncryptedClientHello {
                 let data_at = start + r.used() - data.len();
                 ech = Some(OuterEch::read(data, data_at)?);
             }
@@ -325,20 +330,20 @@ impl<'a> Outer<'a> {
         let mut r = Reader::init(extensions);
         while r.any_left() {
             let at = r.used();
-            let kind = u16::read(&mut r).ok()?;
+            let kind = ExtensionType::read(&mut r).ok()?;
             let data = prefixed16(&mut r)?;
-            if kind != ECH_OUTER_EXTENSIONS {
+            if kind != ExtensionType::EncryptedClientHelloOuterExtensions {
                 rebuilt.extend_from_slice(extensions.get(at..r.used())?);
                 continue;
             }
             let mut named = Reader::init(data);
-            let types = prefixed8(&mut named)?;
-            if named.any_left() || types.is_empty() || types.len() % 2 != 0 {
+            let mut types = Reader::init(prefixed8(&mut named)?);
+            if named.any_left() || !types.any_left() {
                 return None;
             }
-            for wanted in types.chunks(2) {
-                let wanted = u16::from_be_bytes([wanted[0], wanted[1]]);
-                if wanted == ENCRYPTED_CLIENT_HELLO {
+            while types.any_left() {
+                let wanted = ExtensionType::read(&mut types).ok()?;
+                if wanted == ExtensionType::EncryptedClientHello {
                     return None;
                 }
                 // In the outer hello's order: each is looked for after the last.
@@ -360,12 +365,8 @@ impl<'a> Outer<'a> {
         body.extend_from_slice(&rebuilt);
 
         let mut message = Vec::with_capacity(body.len() + 4);
-        message.push(CLIENT_HELLO);
-        message.extend_from_slice(
-            &u32::try_from(body.len())
-                .ok()?
-                .to_be_bytes()[1..],
-        );
+        HandshakeType::ClientHello.encode(&mut message);
+        u24(u32::try_from(body.len()).ok()?).encode(&mut message);
         message.extend_from_slice(&body);
         Some(message)
     }
@@ -376,7 +377,7 @@ impl<'a> OuterEch<'a> {
     /// the hello's body; `None` for an inner one, or one that doesn't parse.
     fn read(data: &'a [u8], at: usize) -> Option<Self> {
         let mut r = Reader::init(data);
-        if u8::read(&mut r).ok()? != OUTER {
+        if EchClientHelloType::read(&mut r).ok()? != EchClientHelloType::ClientHelloOuter {
             return None;
         }
         let cipher_suite = HpkeSymmetricCipherSuite::read(&mut r).ok()?;
@@ -394,11 +395,6 @@ impl<'a> OuterEch<'a> {
             payload: end - payload.len()..end,
         })
     }
-}
-
-fn u24(r: &mut Reader<'_>) -> Option<usize> {
-    let bytes = r.take(3)?;
-    Some(usize::from(bytes[0]) << 16 | usize::from(bytes[1]) << 8 | usize::from(bytes[2]))
 }
 
 fn prefixed8<'a>(r: &mut Reader<'a>) -> Option<&'a [u8]> {

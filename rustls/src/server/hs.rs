@@ -21,8 +21,8 @@ use crate::msgs::enums::{Compression, ExtensionType, NamedGroup};
 #[cfg(feature = "tls12")]
 use crate::msgs::handshake::SessionId;
 use crate::msgs::handshake::{
-    ClientHelloPayload, HandshakePayload, KeyExchangeAlgorithm, ProtocolName, Random,
-    ServerExtensions, ServerExtensionsInput, ServerNamePayload, SingleProtocolName,
+    ClientHelloPayload, EncryptedClientHello, HandshakePayload, KeyExchangeAlgorithm, ProtocolName,
+    Random, ServerExtensions, ServerExtensionsInput, ServerNamePayload, SingleProtocolName,
     TransportParameters,
 };
 use crate::msgs::message::{Message, MessagePayload};
@@ -382,10 +382,26 @@ impl ExpectClientHello {
         })?;
         let (client_hello, sig_schemes) =
             process_client_hello(&inner, self.previous_hello.is_some(), cx)?;
+        // An inner hello says it is one, and offers TLS 1.3 alone (RFC 9849 §7.1).
+        let is_inner = matches!(
+            client_hello.encrypted_client_hello,
+            Some(EncryptedClientHello::Inner)
+        );
+        let tls13_alone = client_hello
+            .supported_versions
+            .as_ref()
+            .is_some_and(|versions| versions.tls13 && !versions.tls12);
+        if !is_inner || !tls13_alone {
+            return Err(cx.common.send_fatal_alert(
+                AlertDescription::IllegalParameter,
+                PeerMisbehaved::IllegalEchInnerHello,
+            ));
+        }
         self.with_hello(sig_schemes, client_hello, &inner, cx)
     }
 
-    /// Handles `client_hello`, the hello the handshake runs on.
+    /// Handles `client_hello`, the hello the handshake runs on. FAIM: upstream's
+    /// `with_certified_key`, renamed so an opened ECH runs it on the inner hello.
     fn with_hello(
         self,
         mut sig_schemes: Vec<SignatureScheme>,
@@ -784,20 +800,12 @@ impl State<ServerConnectionData> for ExpectClientHello {
         // its inner hello, and one that doesn't open ends it (RFC 9849 §7.1.1).
         let mut this = self;
         if let Some(accepting) = &mut this.ech {
-            let Some(inner_hello) = accepting.open_retry(&m) else {
-                let outer = require_handshake_msg!(
-                    m,
-                    HandshakeType::ClientHello,
-                    HandshakePayload::ClientHello
-                )?;
-                let alert = match outer.encrypted_client_hello {
-                    Some(_) => AlertDescription::DecryptError,
-                    None => AlertDescription::MissingExtension,
-                };
-                return Err(cx
-                    .common
-                    .send_fatal_alert(alert, PeerMisbehaved::EchNotOpenedAfterRetry));
-            };
+            let inner_hello = accepting
+                .open_retry(&m)
+                .map_err(|alert| {
+                    cx.common
+                        .send_fatal_alert(alert, PeerMisbehaved::EchNotOpenedAfterRetry)
+                })?;
             return this.with_inner_hello(&inner_hello, cx);
         }
         let (client_hello, sig_schemes) =

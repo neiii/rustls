@@ -3,6 +3,8 @@
 
 #![allow(clippy::disallowed_types, clippy::duplicate_mod)]
 
+use std::io::{Read, Write};
+
 use pki_types::EchConfigListBytes;
 use rustls::client::{EchConfig, EchGreaseConfig, EchMode, EchStatus};
 use rustls::crypto::hpke::{Hpke, HpkePublicKey};
@@ -136,6 +138,47 @@ fn a_hello_sealed_to_a_key_the_server_holds_is_accepted_and_answered_as_its_inne
 
     assert_eq!(client.ech_status(), EchStatus::Accepted);
     assert_eq!(server.server_name(), Some(INNER));
+    // Both sides went on with the same keys.
+    client
+        .writer()
+        .write_all(b"over ECH")
+        .unwrap();
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    let mut read = [0; 8];
+    server
+        .reader()
+        .read_exact(&mut read)
+        .unwrap();
+    assert_eq!(&read, b"over ECH");
+}
+
+#[test]
+fn a_hello_accepted_through_an_acceptor_is_answered_as_its_inner_hello() {
+    let (config, key) = ech_key(7);
+    let mut client = ech_client(&config, None);
+    let mut server_config = make_server_config(KeyType::Rsa2048, &provider::default_provider());
+    server_config.ech_keys = vec![key];
+
+    let mut server = peeked(&mut client)
+        .into_connection(Arc::new(server_config))
+        .unwrap();
+    do_handshake(&mut client, &mut server);
+
+    assert_eq!(client.ech_status(), EchStatus::Accepted);
+    assert_eq!(server.server_name(), Some(INNER));
+    client
+        .writer()
+        .write_all(b"over ECH")
+        .unwrap();
+    transfer(&mut client, &mut server);
+    server.process_new_packets().unwrap();
+    let mut read = [0; 8];
+    server
+        .reader()
+        .read_exact(&mut read)
+        .unwrap();
+    assert_eq!(&read, b"over ECH");
 }
 
 #[test]
@@ -208,10 +251,10 @@ fn a_peeked_hello_opens_to_its_inner_hello_with_the_key_that_opens_it() {
     let (_, other) = ech_key(7);
     let mut client = ech_client(&config, None);
 
-    let opened = peeked(&mut client)
-        .open_ech(&[other, key])
-        .unwrap();
+    let peeked = peeked(&mut client);
+    let opened = peeked.open_ech(&[other, key]).unwrap();
 
+    assert_eq!(peeked.ech_config_id(), Some(7));
     assert_eq!(opened.key(), 1);
     let inner = opened.inner_hello();
     assert_eq!(inner[0], 1, "a ClientHello");

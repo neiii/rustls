@@ -429,7 +429,9 @@ mod client_hello {
                     .map(|x| &x.master_secret.0[..]),
                 &self.config,
                 self.answer.as_ref(),
-                self.ech.is_some(),
+                self.ech
+                    .is_some()
+                    .then_some(&self.randoms.client),
             )?;
             if !self.previous_hello.is_some() {
                 emit_fake_ccs(cx.common);
@@ -580,7 +582,7 @@ mod client_hello {
         resuming_psk: Option<&[u8]>,
         config: &ServerConfig,
         answer: Option<&faim_template::Answer>,
-        accepted_ech: bool,
+        ech_inner_random: Option<&[u8; 32]>,
     ) -> Result<KeyScheduleHandshake, Error> {
         // Prepare key exchange; the caller already found the matching SupportedKxGroup
         let (share, kxgroup) = share_and_kxgroup;
@@ -630,23 +632,22 @@ mod client_hello {
                 }
             })
         };
-        let sh = match accepted_ech {
-            // FAIM: an accepted ECH ends the random with the confirmation of the inner
-            // hello, computed over the `ServerHello` with those bytes zeroed (RFC 9849
-            // §7.2).
-            true => {
-                let mut random = randoms.server;
-                random[24..].fill(0);
-                let mut confirming = transcript.clone();
-                confirming.add_message(&server_hello(random)?);
-                random[24..].copy_from_slice(&server_ech_accept_confirmation(
-                    suite.hkdf_provider,
-                    &randoms.client,
-                    confirming.current_hash(),
-                ));
-                server_hello(random)?
-            }
-            false => server_hello(randoms.server)?,
+        // FAIM: `ech_inner_random`, the inner hello's random when the server accepted
+        // the client's ECH, ends the random with the acceptance confirmation, computed
+        // over the `ServerHello` with those bytes zeroed (RFC 9849 §7.2).
+        let sh = if let Some(inner_random) = ech_inner_random {
+            let mut random = randoms.server;
+            random[24..].fill(0);
+            let mut confirming = transcript.clone();
+            confirming.add_message(&server_hello(random)?);
+            random[24..].copy_from_slice(&server_ech_accept_confirmation(
+                suite.hkdf_provider,
+                inner_random,
+                confirming.current_hash(),
+            ));
+            server_hello(random)?
+        } else {
+            server_hello(randoms.server)?
         };
 
         cx.common.check_aligned_handshake()?;
