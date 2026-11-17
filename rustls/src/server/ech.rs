@@ -114,6 +114,7 @@ impl fmt::Debug for EchServerKey {
 #[derive(Debug, Clone)]
 pub struct OpenedEch {
     inner_hello: Vec<u8>,
+    encoded_inner: Vec<u8>,
     key: usize,
 }
 
@@ -122,6 +123,14 @@ impl OpenedEch {
     /// handshake message, its type and length included.
     pub fn inner_hello(&self) -> &[u8] {
         &self.inner_hello
+    }
+
+    /// The `EncodedClientHelloInner` the client sealed, as it decrypted (RFC 9849
+    /// §5.1): the inner hello without its handshake header, its session id empty and its
+    /// `ech_outer_extensions` as the client sent them, then its padding. FAIM sends the
+    /// inner hello on in this shape (faim-http#601).
+    pub fn encoded_inner(&self) -> &[u8] {
+        &self.encoded_inner
     }
 
     /// Which of the keys it was given opened it, as an index into them.
@@ -159,11 +168,12 @@ pub(super) fn open(m: &Message<'_>, keys: &[Arc<EchServerKey>]) -> Option<(Opene
                 ) else {
                     continue;
                 };
-                let Some(inner_hello) = outer.open_with(&mut *opener) else {
+                let Some((encoded_inner, inner_hello)) = outer.open_with(&mut *opener) else {
                     continue;
                 };
                 let opened = OpenedEch {
                     inner_hello,
+                    encoded_inner,
                     key: index,
                 };
                 let accepting = Accepting {
@@ -196,6 +206,7 @@ impl Accepting {
         }
         outer
             .open_with(&mut *self.opener)
+            .map(|(_, inner_hello)| inner_hello)
             .ok_or(AlertDescription::DecryptError)
     }
 }
@@ -292,8 +303,9 @@ impl<'a> Outer<'a> {
         })
     }
 
-    /// Opens the payload with `opener` and rebuilds the inner hello it holds.
-    fn open_with(&self, opener: &mut dyn HpkeOpener) -> Option<Vec<u8>> {
+    /// Opens the payload with `opener`: the `EncodedClientHelloInner` it holds, and the
+    /// inner hello rebuilt from it.
+    fn open_with(&self, opener: &mut dyn HpkeOpener) -> Option<(Vec<u8>, Vec<u8>)> {
         // The AAD is the outer hello with its payload zeroed (RFC 9849 §5.2).
         let mut aad = self.body.to_vec();
         aad.get_mut(self.ech.payload.clone())?
@@ -302,7 +314,8 @@ impl<'a> Outer<'a> {
             .body
             .get(self.ech.payload.clone())?;
         let encoded = opener.open(&aad, payload).ok()?;
-        self.inner_hello(&encoded)
+        let inner_hello = self.inner_hello(&encoded)?;
+        Some((encoded, inner_hello))
     }
 
     /// The `ClientHello` an `EncodedClientHelloInner` stands for (RFC 9849 §5.1): the

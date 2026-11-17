@@ -339,3 +339,256 @@ fn a_key_for_a_config_naming_no_suite_it_has_is_refused() {
 
     assert!(refused.is_err());
 }
+
+/// A template client sending real ECH (faim-http#601): what a stock client sealed under
+/// a config, sent again from its outer and inner hellos.
+mod template {
+    use faim_template::{ClientHello, ClientTemplate};
+    use rustls::client::{ClientSessionMemoryCache, Resumption};
+    use rustls::server::ServerSessionMemoryCache;
+
+    use super::*;
+
+    /// `client`'s first hello as its records, the outer hello read as a template, and
+    /// its inner hello as `key` opens it.
+    fn first_hello(
+        client: &mut ClientConnection,
+        key: &Arc<EchServerKey>,
+    ) -> (ClientHello, ClientHello, Vec<u8>) {
+        let mut records = Vec::new();
+        client.write_tls(&mut records).unwrap();
+        let opened = accepted(&records)
+            .open_ech(&[Arc::clone(key)])
+            .unwrap();
+        let outer = ClientHello::from_records(&records).unwrap();
+        let inner = ClientHello::from_encoded_inner(
+            opened.encoded_inner(),
+            outer.template.record_version(),
+        )
+        .unwrap();
+        (outer, inner, opened.encoded_inner().to_vec())
+    }
+
+    /// The template of `client`'s first hello, its inner hello opened with `key`.
+    fn template_of(client: &mut ClientConnection, key: &Arc<EchServerKey>) -> ClientTemplate {
+        let (outer, inner, _) = first_hello(client, key);
+        outer
+            .template
+            .with_inner(inner.template)
+    }
+
+    /// A client config offering real ECH under `config`, with `kx_groups` where given,
+    /// then made over by `configure`.
+    fn ech_config_with(
+        config: &[u8],
+        kx_groups: Option<Vec<&'static dyn rustls::crypto::SupportedKxGroup>>,
+        configure: impl FnOnce(&mut ClientConfig),
+    ) -> Arc<ClientConfig> {
+        let mut list = (config.len() as u16)
+            .to_be_bytes()
+            .to_vec();
+        list.extend_from_slice(config);
+        let ech = EchConfig::new(EchConfigListBytes::from(list), &[hpke()]).unwrap();
+        let mut provider = provider::default_provider();
+        if let Some(kx_groups) = kx_groups {
+            provider.kx_groups = kx_groups;
+        }
+        let builder = ClientConfig::builder_with_provider(provider.into())
+            .with_ech(EchMode::Enable(ech))
+            .unwrap();
+        let mut client = finish_client_config(KeyType::Rsa2048, builder);
+        configure(&mut client);
+        Arc::new(client)
+    }
+
+    /// A client sending `template`'s hello with real ECH under `config`.
+    fn sending(config: &[u8], template: ClientTemplate) -> Arc<ClientConfig> {
+        ech_config_with(config, None, |client| {
+            client.hello_template = Some(Arc::new(template));
+        })
+    }
+
+    fn connect(config: &Arc<ClientConfig>) -> ClientConnection {
+        ClientConnection::new(Arc::clone(config), server_name(INNER)).unwrap()
+    }
+
+    #[test]
+    fn a_template_hello_seals_its_inner_hello_to_the_config_and_the_server_accepts_it() {
+        let (config, key) = ech_key(7);
+        let stock = ech_config_with(&config, None, |_| {});
+        let template = template_of(&mut connect(&stock), &key);
+        let mut client = connect(&sending(&config, template));
+        let mut server = server_with(|server| server.ech_keys = vec![Arc::clone(&key)]);
+
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(client.ech_status(), EchStatus::Accepted);
+        assert_eq!(server.server_name(), Some(INNER));
+        let inner = client.ech_inner_hello().unwrap();
+        assert_eq!(
+            accepted(&record(inner))
+                .client_hello()
+                .server_name(),
+            Some(INNER),
+            "the inner hello it sealed, as a server reads it"
+        );
+        client
+            .writer()
+            .write_all(b"over ECH")
+            .unwrap();
+        transfer(&mut client, &mut server);
+        server.process_new_packets().unwrap();
+        let mut read = [0; 8];
+        server
+            .reader()
+            .read_exact(&mut read)
+            .unwrap();
+        assert_eq!(&read, b"over ECH");
+    }
+
+    #[test]
+    fn a_stock_client_keeps_the_inner_hello_it_sealed() {
+        let (config, key) = ech_key(7);
+        let mut client = connect(&ech_config_with(&config, None, |_| {}));
+        let mut server = server_with(|server| server.ech_keys = vec![key]);
+
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(client.ech_status(), EchStatus::Accepted);
+        let inner = client.ech_inner_hello().unwrap();
+        assert_eq!(
+            accepted(&record(inner))
+                .client_hello()
+                .server_name(),
+            Some(INNER)
+        );
+    }
+
+    #[test]
+    fn a_template_hellos_inner_hello_is_its_clients_but_for_the_fresh_fields() {
+        let (config, key) = ech_key(7);
+        let stock = ech_config_with(&config, None, |_| {});
+        let (outer, inner, encoded) = first_hello(&mut connect(&stock), &key);
+        let template = outer
+            .template
+            .clone()
+            .with_inner(inner.template.clone());
+        let mut client = connect(&sending(&config, template));
+
+        let (_, sent_inner, sent_encoded) = first_hello(&mut client, &key);
+
+        assert_eq!(sent_inner.template, inner.template);
+        assert_eq!(sent_encoded.len(), encoded.len());
+        assert_ne!(sent_inner.fresh.random, inner.fresh.random);
+        assert_eq!(sent_inner.fresh.server_name.as_deref(), Some(INNER));
+    }
+
+    #[test]
+    fn a_template_hello_keeps_its_ech_across_a_hello_retry_request() {
+        let (config, key) = ech_key(7);
+        let kx = provider::default_provider().kx_groups;
+        let x25519 = kx
+            .iter()
+            .find(|group| u16::from(group.name()) == 0x1d)
+            .copied()
+            .unwrap();
+        let secp256r1 = kx
+            .iter()
+            .find(|group| u16::from(group.name()) == 0x17)
+            .copied()
+            .unwrap();
+        // The client sends a key share for X25519 alone, which the server can't use.
+        let stock = ech_config_with(&config, Some(vec![x25519, secp256r1]), |_| {});
+        let template = template_of(&mut connect(&stock), &key);
+        let mut client = connect(&sending(&config, template));
+        let mut server = {
+            let mut config = make_server_config_with_kx_groups(
+                KeyType::Rsa2048,
+                vec![secp256r1],
+                &provider::default_provider(),
+            );
+            config.ech_keys = vec![key];
+            ServerConnection::new(Arc::new(config)).unwrap()
+        };
+
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(
+            server.handshake_kind(),
+            Some(HandshakeKind::FullWithHelloRetryRequest)
+        );
+        assert_eq!(client.ech_status(), EchStatus::Accepted);
+        assert_eq!(server.server_name(), Some(INNER));
+    }
+
+    #[test]
+    fn a_template_hello_under_a_config_the_server_rejects_ends_with_its_retry_configs() {
+        let (config, key) = ech_key(7);
+        let (_, other) = ech_key(7);
+        let (retry, _) = ech_key(8);
+        let mut list = (retry.len() as u16)
+            .to_be_bytes()
+            .to_vec();
+        list.extend_from_slice(&retry);
+        let stock = ech_config_with(&config, None, |_| {});
+        let template = template_of(&mut connect(&stock), &key);
+        let mut client = connect(&sending(&config, template));
+        let mut server = server_with(|server| {
+            server.ech_keys = vec![other];
+            server.ech_retry_configs = Some(list.into());
+        });
+
+        let refused = do_handshake_until_error(&mut client, &mut server);
+
+        assert!(
+            matches!(
+                &refused,
+                Err(ErrorFromPeer::Client(Error::PeerIncompatible(
+                    PeerIncompatible::ServerRejectedEncryptedClientHello(Some(configs))
+                ))) if configs.len() == 1
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(client.ech_status(), EchStatus::Rejected);
+    }
+
+    #[test]
+    fn a_template_hello_resumes_inside_its_inner_hello() {
+        let (config, key) = ech_key(7);
+        let store = Resumption::store(Arc::new(ClientSessionMemoryCache::new(8)));
+        let stock = ech_config_with(&config, None, |client| {
+            client.resumption = store.clone();
+        });
+        let server_config = {
+            let mut server = make_server_config(KeyType::Rsa2048, &provider::default_provider());
+            server.ech_keys = vec![Arc::clone(&key)];
+            server.session_storage = ServerSessionMemoryCache::new(32);
+            Arc::new(server)
+        };
+        let mut first = connect(&stock);
+        let mut answering = ServerConnection::new(Arc::clone(&server_config)).unwrap();
+        do_handshake(&mut first, &mut answering);
+        // The returning client's hello offers one ticket; the other stays in the store.
+        let template = template_of(&mut connect(&stock), &key);
+        assert!(
+            template
+                .inner()
+                .unwrap()
+                .offers(faim_template::ExtensionType::PRE_SHARED_KEY)
+        );
+        let sending = ech_config_with(&config, None, |client| {
+            client.resumption = store.clone();
+            // Its verifier is another than the one the session was made under.
+            client.resumes_session_as_given = true;
+            client.hello_template = Some(Arc::new(template));
+        });
+
+        let mut client = connect(&sending);
+        let mut server = ServerConnection::new(server_config).unwrap();
+        do_handshake(&mut client, &mut server);
+
+        assert_eq!(client.ech_status(), EchStatus::Accepted);
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+        assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+    }
+}

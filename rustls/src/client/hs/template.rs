@@ -9,13 +9,14 @@
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
 pub(in crate::client) use faim_template::Shortfall;
 use faim_template::{
-    ClientTemplate, EchPayload, Fresh, KeyShare, KeyShareSlot, Psk, PskIdentity, RetryRequest,
+    ClientTemplate, EchPayload, Fresh, KeyShare, KeyShareSlot, Psk, PskIdentity, RenderedHello,
+    RetryRequest,
 };
 use pki_types::ServerName;
 
@@ -24,6 +25,7 @@ use super::{
     NextStateOrError,
 };
 use crate::SupportedCipherSuite;
+use crate::client::ech::EchState;
 use crate::client::{ClientConfig, EchStatus, tls13};
 use crate::common_state::{CommonState, HandshakeFlightTls13, KxState};
 use crate::crypto::{ActiveKeyExchange, SecureRandom};
@@ -44,6 +46,7 @@ use crate::msgs::handshake::{
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
 use crate::sync::Arc;
+use crate::tls13::key_schedule::KeyScheduleEarly;
 
 /// The `delegated_credential` extension (RFC 9345). A server that sends one signs the
 /// handshake with the credential's key, which the fork can't verify.
@@ -150,6 +153,12 @@ pub(super) struct Retry<'a> {
 /// a first hello sent) when one is for its group, else one the provider makes. A group
 /// the provider can't make a key for gets random bytes of the recorded length, since a
 /// server that picks it gets a [`Shortfall`] anyway; a retry sends those bytes again.
+///
+/// With `ech_state`, the hello sends real ECH (faim-http#601): the template's inner hello,
+/// sealed under the config `ech_state` was made from, with the outer hello naming that
+/// config's public name. A retry after a `HelloRetryRequest` that rejected the ECH sends
+/// the first hello's ECH bytes again, as stock rustls does.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emit_client_hello(
     template: Arc<ClientTemplate>,
     mut transcript_buffer: HandshakeHashBuffer,
@@ -158,6 +167,7 @@ pub(super) fn emit_client_hello(
     extra_exts: ClientExtensionsInput<'static>,
     mut input: ClientHelloInput,
     cx: &mut ClientContext<'_>,
+    mut ech_state: Option<EchState>,
 ) -> NextStateOrError<'static> {
     let config = Arc::clone(&input.config);
     let retryreq = retry
@@ -175,6 +185,27 @@ pub(super) fn emit_client_hello(
         None => Cow::Borrowed(&*template),
     };
     let random = config.provider.secure_random;
+    // Real ECH, unless a `HelloRetryRequest` rejected it: the outer hello then names the
+    // config real ECH goes out under, which may not be the one its client named.
+    let real_ech = ech_state
+        .as_ref()
+        .filter(|_| cx.data.ech_status != EchStatus::Rejected);
+    let template = match real_ech {
+        Some(ech) => {
+            let (config_id, kdf, aead) = ech.template_config();
+            Cow::Owned(template.under_ech_config(
+                faim_template::EchConfigId(config_id),
+                faim_template::HpkeKdf(kdf),
+                faim_template::HpkeAead(aead),
+            ))
+        }
+        None => template,
+    };
+    // The hello that may resume and send early data: the inner one, under real ECH.
+    let resuming_hello = match real_ech {
+        Some(_) => template.inner().unwrap_or(&template),
+        None => &template,
+    };
 
     // FAIM: the session this connection resumes, if faim-http gave it one. A retry resumes
     // it only under a suite that can (RFC 8446 §4.2.11).
@@ -187,7 +218,7 @@ pub(super) fn emit_client_hello(
             config.enable_early_data
                 && retryreq.is_none()
                 && session.max_early_data_size() > 0
-                && template.offers(faim_template::ExtensionType::EARLY_DATA)
+                && resuming_hello.offers(faim_template::ExtensionType::EARLY_DATA)
         })
         .map(|session| session.max_early_data_size() as usize);
     let template = match early_data {
@@ -265,13 +296,12 @@ pub(super) fn emit_client_hello(
             random_bytes(random, shape.payload_len())?,
         )),
     };
-    if fresh.ech.is_some() {
+    if fresh.ech.is_some() && ech_state.is_none() {
         // A server's retry configs are then ignored rather than refused.
         cx.data.ech_status = EchStatus::Grease;
     }
-    input.template_ech = fresh.ech.clone();
 
-    if let Some(session) = &session {
+    let psk = session.as_ref().map(|session| {
         cx.common.suite = Some(session.suite().into());
         let binder = vec![
             0;
@@ -281,19 +311,53 @@ pub(super) fn emit_client_hello(
                 .hash_provider
                 .output_len()
         ];
-        fresh.psk = Some(Psk::new(vec![PskIdentity::new(
+        Psk::new(vec![PskIdentity::new(
             session.ticket().to_vec(),
             session.obfuscated_ticket_age(),
             binder,
-        )]));
-    }
-
-    let mut rendered = template
-        .render(&fresh)
-        .map_err(|error| Error::General(error.to_string()))?;
-    let early_data_key_schedule = session.as_ref().map(|session| {
-        tls13::fill_in_template_psk_binder(session, &transcript_buffer, &mut rendered.message)
+        )])
     });
+
+    let real_ech = ech_state
+        .as_mut()
+        .filter(|_| cx.data.ech_status != EchStatus::Rejected);
+    let (rendered, early_data_key_schedule) = match real_ech {
+        Some(ech) => {
+            let inner = InnerFresh {
+                server_name: fresh.server_name.take(),
+                psk,
+            };
+            // The outer hello names the config's public name.
+            fresh.server_name = Some(ech.outer_name.as_ref().to_string());
+            let sent = seal_inner(
+                &template,
+                &mut fresh,
+                inner,
+                ech,
+                session.as_ref(),
+                retryreq.is_some(),
+                random,
+            )?;
+            cx.data.ech_status = EchStatus::Offered;
+            cx.data.ech_inner_hello = Some(ech.sent_inner_hello.clone());
+            sent
+        }
+        None => {
+            fresh.psk = psk;
+            let mut rendered = template
+                .render(&fresh)
+                .map_err(render_error)?;
+            let early_data_key_schedule = session.as_ref().map(|session| {
+                tls13::fill_in_template_psk_binder(
+                    session,
+                    &transcript_buffer,
+                    &mut rendered.message,
+                )
+            });
+            (rendered, early_data_key_schedule)
+        }
+    };
+    input.template_ech = fresh.ech.clone();
     // rustls reads the hello it sends, as it would its own, for what it checks the
     // server's answer against.
     let payload = MessagePayload::new(
@@ -343,14 +407,22 @@ pub(super) fn emit_client_hello(
         (&session, &early_data_key_schedule, early_data)
     {
         cx.data.early_data.enable(max);
+        // Under real ECH, the inner hello's transcript and random (RFC 9849 §6.1).
+        let (early_transcript, early_random) = match ech_state
+            .as_ref()
+            .filter(|_| cx.data.ech_status == EchStatus::Offered)
+        {
+            Some(ech) => (&ech.inner_hello_transcript, &ech.inner_hello_random.0),
+            None => (&transcript_buffer, &input.random.0),
+        };
         tls13::derive_early_traffic_secret(
             &*config.key_log,
             cx,
             session.suite().common.hash_provider,
             schedule,
             &mut input.sent_tls13_fake_ccs,
-            &transcript_buffer,
-            &input.random.0,
+            early_transcript,
+            early_random,
         );
     }
     drop(session);
@@ -364,7 +436,7 @@ pub(super) fn emit_client_hello(
         offered_key_share: active.next(),
         template_shares: active.collect(),
         suite: retry.map(|retry| retry.suite),
-        ech_state: None,
+        ech_state,
     };
     Ok(if offers_tls13 && retryreq.is_none() {
         Box::new(ExpectServerHelloOrHelloRetryRequest {
@@ -706,6 +778,160 @@ pub(in crate::client) fn named_group(group: NamedGroup) -> faim_template::NamedG
 }
 
 /// `len` random bytes.
+/// What an inner hello sends of the connection's own: the name it asks for, and the
+/// session it resumes.
+struct InnerFresh {
+    server_name: Option<String>,
+    psk: Option<Psk>,
+}
+
+/// The outer hello `template` sends with `fresh`, its inner hello sealed inside under
+/// `ech` (RFC 9849 §6.1, faim-http#601), and the early key schedule of a session the
+/// inner hello resumes.
+///
+/// The inner hello takes the outer hello's fresh keys, group by group, and a group only
+/// it sends a key share for is a [`Shortfall`]. It is padded to the length its client
+/// sealed, so the payload is as long as the client's. The outer hello carries a GREASE
+/// PSK of the inner one's shape (§6.1.2), and the inner hello goes into `ech`'s transcript.
+fn seal_inner(
+    template: &ClientTemplate,
+    fresh: &mut Fresh,
+    inner: InnerFresh,
+    ech: &mut EchState,
+    session: Option<&persist::Retrieved<&persist::Tls13ClientSessionValue>>,
+    retrying: bool,
+    random: &'static dyn SecureRandom,
+) -> Result<(RenderedHello, Option<KeyScheduleEarly>), Error> {
+    let (Some(inner_template), Some(shape)) = (template.inner(), template.ech()) else {
+        return Err(Error::General(
+            "a template sends real ECH only with an inner hello and an outer ECH extension"
+                .to_string(),
+        ));
+    };
+    let mut inner_fresh = Fresh::new(ech.inner_hello_random.0, Vec::new());
+    inner_fresh.server_name = inner.server_name;
+    for slot in inner_template.key_share_slots() {
+        let KeyShareSlot::Key { group, .. } = slot else {
+            continue;
+        };
+        let share = fresh
+            .key_shares
+            .iter()
+            .find(|share| share.group == *group)
+            .ok_or(Shortfall::InnerKeyShare(*group))?;
+        inner_fresh
+            .key_shares
+            .push(share.clone());
+    }
+    fresh.psk = inner
+        .psk
+        .as_ref()
+        .map(|psk| grease_psk(psk, random))
+        .transpose()?;
+    inner_fresh.psk = inner.psk;
+
+    // A hello after a `HelloRetryRequest` carries no `enc` (RFC 9849 §6.1.5).
+    let enc = match retrying {
+        true => Vec::new(),
+        false => ech.template_enc().to_vec(),
+    };
+    let tag_len = ech.template_tag_len();
+    let padded_len = shape
+        .payload_len()
+        .saturating_sub(tag_len);
+    fresh.ech = Some(EchPayload::new(enc.clone(), vec![0; shape.payload_len()]));
+    let mut outer = template
+        .render(fresh)
+        .map_err(render_error)?;
+    let mut sealed = inner_template
+        .render_inner(&inner_fresh, &outer.message, padded_len)
+        .map_err(render_error)?;
+    let early_key_schedule = match session {
+        Some(session) => {
+            let schedule = tls13::fill_in_template_psk_binder(
+                session,
+                &ech.inner_hello_transcript,
+                &mut sealed.hello.message,
+            );
+            // The binder goes into the sealed hello too, where the PSK comes last as well.
+            let hash_len = session
+                .suite()
+                .common
+                .hash_provider
+                .output_len();
+            let message = &sealed.hello.message;
+            let binder = message[message.len() - hash_len..].to_vec();
+            if let Some(identity) = inner_fresh
+                .psk
+                .as_mut()
+                .and_then(|psk| psk.identities.first_mut())
+            {
+                identity.binder = binder;
+            }
+            sealed = inner_template
+                .render_inner(&inner_fresh, &outer.message, padded_len)
+                .map_err(render_error)?;
+            Some(schedule)
+        }
+        None => None,
+    };
+    let payload_len = sealed.encoded.len() + tag_len;
+    if payload_len != shape.payload_len() {
+        fresh.ech = Some(EchPayload::new(enc.clone(), vec![0; payload_len]));
+        outer = template
+            .render(fresh)
+            .map_err(render_error)?;
+    }
+    // The AAD is the outer hello's body with its payload zeroed (RFC 9849 §5.2).
+    let payload = ech.seal_template_inner(&outer.message[4..], &sealed.encoded)?;
+    fresh.ech = Some(EchPayload::new(enc, payload));
+    let outer = template
+        .render(fresh)
+        .map_err(render_error)?;
+
+    let inner_message = Message {
+        version: ProtocolVersion::TLSv1_2,
+        payload: MessagePayload::new(
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &sealed.hello.message,
+        )?
+        .into_owned(),
+    };
+    let sent = sealed
+        .hello
+        .offered
+        .iter()
+        .map(|kind| ExtensionType::from(kind.0))
+        .collect();
+    ech.take_template_inner(&inner_message, sent);
+    Ok((outer, early_key_schedule))
+}
+
+/// A GREASE PSK in `psk`'s shape: random identities, ages and binders of the same
+/// lengths (RFC 9849 §6.1.2).
+fn grease_psk(psk: &Psk, random: &dyn SecureRandom) -> Result<Psk, Error> {
+    let identities = psk
+        .identities
+        .iter()
+        .map(|identity| {
+            let mut age = [0; 4];
+            random.fill(&mut age)?;
+            Ok(PskIdentity::new(
+                random_bytes(random, identity.identity.len())?,
+                u32::from_be_bytes(age),
+                random_bytes(random, identity.binder.len())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(Psk::new(identities))
+}
+
+/// A template that didn't render, as rustls's error.
+fn render_error(error: faim_template::RenderError) -> Error {
+    Error::General(error.to_string())
+}
+
 fn random_bytes(secure_random: &dyn SecureRandom, len: usize) -> Result<Vec<u8>, Error> {
     let mut bytes = vec![0; len];
     secure_random.fill(&mut bytes)?;
