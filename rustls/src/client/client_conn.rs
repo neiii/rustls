@@ -865,6 +865,17 @@ mod connection {
                 .as_flight()
         }
 
+        /// FAIM: the inner `ClientHello` this client last sealed into real ECH, a handshake
+        /// message as its transcript has it: after a `HelloRetryRequest`, the second.
+        /// `None` for a client that sent no real ECH (faim-http#601).
+        pub fn ech_inner_hello(&self) -> Option<&[u8]> {
+            self.inner
+                .core
+                .data
+                .ech_inner_hello
+                .as_deref()
+        }
+
         /// Return the connection's Encrypted Client Hello (ECH) status.
         pub fn ech_status(&self) -> EchStatus {
             self.inner.core.data.ech_status
@@ -1149,6 +1160,9 @@ pub struct ClientConnectionData {
     pub(super) template_offered: Vec<crate::msgs::enums::ExtensionType>,
     /// FAIM: what the server answered a template's hello with.
     pub(super) template_flight: hs::template::KeptFlight,
+    /// FAIM: the inner hello the client last sealed into real ECH, as its transcript has
+    /// it (faim-http#601).
+    pub(super) ech_inner_hello: Option<Vec<u8>>,
 }
 
 impl ClientConnectionData {
@@ -1159,6 +1173,7 @@ impl ClientConnectionData {
             template_alps: None,
             template_offered: Vec::new(),
             template_flight: hs::template::KeptFlight::default(),
+            ech_inner_hello: None,
         }
     }
 }

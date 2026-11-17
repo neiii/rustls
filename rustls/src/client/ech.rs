@@ -329,6 +329,8 @@ pub(crate) struct EchState {
     // Whether a hello retry request accepted our ECH offer, if we received one. RFC 9849
     // section 6.1.4 makes that decision final.
     accepted_by_hello_retry_request: Option<bool>,
+    // FAIM: the inner hello last sealed, as the transcript has it (faim-http#601).
+    pub(crate) sent_inner_hello: Vec<u8>,
 }
 
 impl EchState {
@@ -374,6 +376,7 @@ impl EchState {
             enable_sni,
             sent_extensions: Vec::new(),
             accepted_by_hello_retry_request: None,
+            sent_inner_hello: Vec::new(),
         })
     }
 
@@ -447,6 +450,56 @@ impl EchState {
         outer_hello.encrypted_client_hello = Some(outer_hello_ext(self, enc, payload));
 
         Ok(outer_hello)
+    }
+
+    /// FAIM: the config id and HPKE suite the outer hello's ECH names, for a template's
+    /// hello to name them too (faim-http#601).
+    pub(crate) fn template_config(&self) -> (faim_template::EchConfigId, faim_template::EchSuite) {
+        let suite = faim_template::EchSuite::new(
+            faim_template::HpkeKdf(u16::from(self.cipher_suite.kdf_id)),
+            faim_template::HpkeAead(u16::from(self.cipher_suite.aead_id)),
+        );
+        (faim_template::EchConfigId(self.config_id), suite)
+    }
+
+    /// FAIM: the encapsulated key a first outer hello carries.
+    pub(crate) fn template_enc(&self) -> &[u8] {
+        &self.enc.0
+    }
+
+    /// FAIM: how many bytes sealing adds to a template's inner hello.
+    pub(crate) fn template_tag_len(&self) -> usize {
+        // Safety: the config was only chosen for an AEAD with a tag (`EchConfig::new`).
+        self.cipher_suite
+            .aead_id
+            .tag_len()
+            .unwrap()
+    }
+
+    /// FAIM: seals `encoded`, a template's `EncodedClientHelloInner`, under the outer
+    /// hello `aad`, its ECH payload zeroed (RFC 9849 §5.2).
+    pub(crate) fn seal_template_inner(
+        &mut self,
+        aad: &[u8],
+        encoded: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        self.sender.seal(aad, encoded)
+    }
+
+    /// FAIM: takes in `inner`, the inner hello a template sent, as the inner transcript's
+    /// hello, offering `sent_extensions` to a server that accepts it.
+    pub(crate) fn take_template_inner(
+        &mut self,
+        inner: &Message<'_>,
+        sent_extensions: Vec<ExtensionType>,
+    ) {
+        self.inner_hello_transcript
+            .add_message(inner);
+        self.sent_inner_hello = Vec::new();
+        inner
+            .payload
+            .encode(&mut self.sent_inner_hello);
+        self.sent_extensions = sent_extensions;
     }
 
     /// Confirm whether an ECH offer was accepted based on examining the server hello.
@@ -755,6 +808,11 @@ impl EchState {
         // Update the inner transcript buffer with the inner hello message.
         self.inner_hello_transcript
             .add_message(&inner_hello_msg);
+        // FAIM: kept for `ClientConnection::ech_inner_hello`.
+        self.sent_inner_hello = Vec::new();
+        inner_hello_msg
+            .payload
+            .encode(&mut self.sent_inner_hello);
 
         encoded_hello
     }

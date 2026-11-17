@@ -173,17 +173,24 @@ impl ClientHelloInput {
         // FAIM: a template's hello makes its own key shares. It carries its client's
         // recorded quic_transport_parameters rather than this connection's, so a QUIC
         // connection is a shortfall FAIM passes through, checked first so the caller
-        // always sees it. It greases ECH in its client's shape, so a config that asks
-        // for real ECH would silently lose it.
+        // always sees it. It greases ECH in its client's shape, unless the config asks
+        // for real ECH and the template carries the inner hello to seal (faim-http#601);
+        // without one, real ECH would be silently lost.
         if let Some(hello_template) = self.config.hello_template.clone() {
             if cx.common.is_quic() {
                 return Err(faim_template::Shortfall::Quic.into());
             }
-            if let Some(EchMode::Enable(_)) = &self.config.ech_mode {
-                return Err(Error::General(
-                    "a hello template can't send real ECH (ClientConfig::hello_template)".into(),
-                ));
-            }
+            let ech_state = match &self.config.ech_mode {
+                Some(EchMode::Enable(ech_config)) if hello_template.inner().is_some() => {
+                    Some(ech_config.state(self.server_name.clone(), &self.config)?)
+                }
+                Some(EchMode::Enable(_)) => {
+                    return Err(Error::General(
+                        "a hello template sends real ECH only with an inner hello (ClientConfig::hello_template)".into(),
+                    ));
+                }
+                _ => None,
+            };
             return template::emit_client_hello(
                 hello_template,
                 transcript_buffer,
@@ -192,6 +199,7 @@ impl ClientHelloInput {
                 extra_exts,
                 self,
                 cx,
+                ech_state,
             );
         }
 
@@ -463,6 +471,8 @@ fn emit_client_hello_for_retry(
             // Replace the client hello payload with an ECH client hello payload.
             chp_payload = ech_state.ech_hello(chp_payload, retryreq, &tls13_session)?;
             cx.data.ech_status = EchStatus::Offered;
+            // FAIM: kept for `ClientConnection::ech_inner_hello`.
+            cx.data.ech_inner_hello = Some(ech_state.sent_inner_hello.clone());
             // Store the ECH extension in case we need to carry it forward in a subsequent hello.
             input.prev_ech_ext = chp_payload
                 .encrypted_client_hello
@@ -1181,6 +1191,7 @@ impl ExpectServerHelloOrHelloRetryRequest {
                 self.extra_exts,
                 self.next.input,
                 cx,
+                self.next.ech_state,
             );
         }
 
