@@ -72,6 +72,9 @@ impl<T> core::ops::Deref for Retrieved<T> {
     }
 }
 
+// FAIM: cloned so faim-http can offer a session again on its retry under a server's ECH
+// retry configs, which never saw the first offer (faim-http#601).
+#[derive(Clone)]
 pub struct Tls13ClientSessionValue {
     suite: &'static Tls13CipherSuite,
     age_add: u32,

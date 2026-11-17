@@ -185,24 +185,17 @@ pub(super) fn emit_client_hello(
         None => Cow::Borrowed(&*template),
     };
     let random = config.provider.secure_random;
-    // Real ECH, unless a `HelloRetryRequest` rejected it: the outer hello then names the
-    // config real ECH goes out under, which may not be the one its client named.
-    let real_ech = ech_state
-        .as_ref()
-        .filter(|_| cx.data.ech_status != EchStatus::Rejected);
-    let template = match real_ech {
+    // Under real ECH the outer hello names the config real ECH goes out under, which may
+    // not be the one its client named, and the inner hello is the one that may resume and
+    // send early data.
+    let template = match &ech_state {
         Some(ech) => {
-            let (config_id, kdf, aead) = ech.template_config();
-            Cow::Owned(template.under_ech_config(
-                faim_template::EchConfigId(config_id),
-                faim_template::HpkeKdf(kdf),
-                faim_template::HpkeAead(aead),
-            ))
+            let (config_id, suite) = ech.template_config();
+            Cow::Owned(template.under_ech_config(config_id, suite))
         }
         None => template,
     };
-    // The hello that may resume and send early data: the inner one, under real ECH.
-    let resuming_hello = match real_ech {
+    let resuming_hello = match &ech_state {
         Some(_) => template.inner().unwrap_or(&template),
         None => &template,
     };
@@ -318,11 +311,8 @@ pub(super) fn emit_client_hello(
         )])
     });
 
-    let real_ech = ech_state
-        .as_mut()
-        .filter(|_| cx.data.ech_status != EchStatus::Rejected);
-    let (rendered, early_data_key_schedule) = match real_ech {
-        Some(ech) => {
+    let (rendered, early_data_key_schedule) = match ech_state.as_mut() {
+        Some(ech) if cx.data.ech_status != EchStatus::Rejected => {
             let inner = InnerFresh {
                 server_name: fresh.server_name.take(),
                 psk,
@@ -341,6 +331,20 @@ pub(super) fn emit_client_hello(
             cx.data.ech_status = EchStatus::Offered;
             cx.data.ech_inner_hello = Some(ech.sent_inner_hello.clone());
             sent
+        }
+        // A `HelloRetryRequest` rejected the ECH: the outer hello goes again with the
+        // first hello's ECH bytes (RFC 9849 §6.1.5), still naming the public name, and
+        // with a GREASE PSK in the inner one's shape, so nothing resumes in the clear.
+        Some(ech) => {
+            fresh.server_name = Some(ech.outer_name.as_ref().to_string());
+            fresh.psk = psk
+                .as_ref()
+                .map(|psk| grease_psk(psk, random))
+                .transpose()?;
+            let rendered = template
+                .render(&fresh)
+                .map_err(render_error)?;
+            (rendered, None)
         }
         None => {
             fresh.psk = psk;
@@ -777,7 +781,6 @@ pub(in crate::client) fn named_group(group: NamedGroup) -> faim_template::NamedG
     faim_template::NamedGroup(u16::from(group))
 }
 
-/// `len` random bytes.
 /// What an inner hello sends of the connection's own: the name it asks for, and the
 /// session it resumes.
 struct InnerFresh {
@@ -932,6 +935,7 @@ fn render_error(error: faim_template::RenderError) -> Error {
     Error::General(error.to_string())
 }
 
+/// `len` random bytes.
 fn random_bytes(secure_random: &dyn SecureRandom, len: usize) -> Result<Vec<u8>, Error> {
     let mut bytes = vec![0; len];
     secure_random.fill(&mut bytes)?;

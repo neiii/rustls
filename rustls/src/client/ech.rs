@@ -452,14 +452,14 @@ impl EchState {
         Ok(outer_hello)
     }
 
-    /// FAIM: the config id, KDF and AEAD the outer hello's ECH names, for a template's
+    /// FAIM: the config id and HPKE suite the outer hello's ECH names, for a template's
     /// hello to name them too (faim-http#601).
-    pub(crate) fn template_config(&self) -> (u8, u16, u16) {
-        (
-            self.config_id,
-            u16::from(self.cipher_suite.kdf_id),
-            u16::from(self.cipher_suite.aead_id),
-        )
+    pub(crate) fn template_config(&self) -> (faim_template::EchConfigId, faim_template::EchSuite) {
+        let suite = faim_template::EchSuite::new(
+            faim_template::HpkeKdf(u16::from(self.cipher_suite.kdf_id)),
+            faim_template::HpkeAead(u16::from(self.cipher_suite.aead_id)),
+        );
+        (faim_template::EchConfigId(self.config_id), suite)
     }
 
     /// FAIM: the encapsulated key a first outer hello carries.

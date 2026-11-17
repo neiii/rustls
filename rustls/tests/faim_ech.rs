@@ -522,6 +522,53 @@ mod template {
     }
 
     #[test]
+    fn a_hello_retry_request_that_rejects_the_ech_gets_the_outer_hello_again_with_no_inner_host() {
+        let (config, key) = ech_key(7);
+        let (_, other) = ech_key(7);
+        let kx = provider::default_provider().kx_groups;
+        let x25519 = kx
+            .iter()
+            .find(|group| u16::from(group.name()) == 0x1d)
+            .copied()
+            .unwrap();
+        let secp256r1 = kx
+            .iter()
+            .find(|group| u16::from(group.name()) == 0x17)
+            .copied()
+            .unwrap();
+        let stock = ech_config_with(&config, Some(vec![x25519, secp256r1]), |_| {});
+        let template = template_of(&mut connect(&stock), &key);
+        let mut client = connect(&sending(&config, template));
+        let mut server = {
+            let mut config = make_server_config_with_kx_groups(
+                KeyType::Rsa2048,
+                vec![secp256r1],
+                &provider::default_provider(),
+            );
+            config.ech_keys = vec![other];
+            ServerConnection::new(Arc::new(config)).unwrap()
+        };
+
+        // The first hello, and the server's HelloRetryRequest, which can't accept the ECH.
+        transfer(&mut client, &mut server);
+        server.process_new_packets().unwrap();
+        transfer(&mut server, &mut client);
+        client.process_new_packets().unwrap();
+        let mut second = Vec::new();
+        client.write_tls(&mut second).unwrap();
+
+        let hello = second
+            .windows(5)
+            .position(|window| window[0] == 0x16)
+            .map(|at| &second[at..])
+            .unwrap();
+        let outer = ClientHello::from_records(hello).unwrap();
+        // The inner host stays out of the second hello's SNI.
+        assert_eq!(outer.fresh.server_name.as_deref(), Some(PUBLIC));
+        assert!(outer.template.ech().is_some());
+    }
+
+    #[test]
     fn a_template_hello_under_a_config_the_server_rejects_ends_with_its_retry_configs() {
         let (config, key) = ech_key(7);
         let (_, other) = ech_key(7);

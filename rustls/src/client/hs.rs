@@ -777,17 +777,17 @@ impl State<ClientConnectionData> for ExpectServerHello {
         // FAIM: a template's version is one it offered, and one the fork speaks.
         if let Some(hello_template) = config.hello_template.as_deref() {
             template::check_version(cx.common, hello_template, server_version)?;
+            // A template's outer hello may offer TLS 1.2 beside real ECH, which a config
+            // sending real ECH never speaks, and a server that picks it has rejected the
+            // ECH, with no retry configs to send (RFC 9849 §6.1.6, faim-http#601).
+            if self.ech_state.is_some() && server_version != TLSv1_3 {
+                return Err(super::ech::fatal_alert_required(None, cx.common));
+            }
         }
 
         let version = match server_version {
             TLSv1_3 if tls13_supported => TLSv1_3,
             TLSv1_2 if config.supports_version(TLSv1_2, cx.common.protocol) => {
-                // FAIM: a template's outer hello may offer TLS 1.2 beside real ECH, and a
-                // server that picks it has rejected the ECH, with no retry configs to
-                // send (RFC 9849 §6.1.6).
-                if self.ech_state.is_some() {
-                    return Err(super::ech::fatal_alert_required(None, cx.common));
-                }
                 if cx.data.early_data.is_enabled() && cx.common.early_traffic {
                     // The client must fail with a dedicated error code if the server
                     // responds with TLS 1.2 when offering 0-RTT.
