@@ -170,16 +170,12 @@ impl ClientHelloInput {
             transcript_buffer.set_client_auth_enabled();
         }
 
-        // FAIM: a template's hello makes its own key shares. It carries its client's
-        // recorded quic_transport_parameters rather than this connection's, so a QUIC
-        // connection is a shortfall FAIM passes through, checked first so the caller
-        // always sees it. It greases ECH in its client's shape, unless the config asks
+        // FAIM: a template's hello makes its own key shares, and on QUIC sends this
+        // connection's own transport parameters where its client sent its own
+        // (faim-http#202). It greases ECH in its client's shape, unless the config asks
         // for real ECH and the template carries the inner hello to seal (faim-http#601);
         // without one, real ECH would be silently lost.
         if let Some(hello_template) = self.config.hello_template.clone() {
-            if cx.common.is_quic() {
-                return Err(faim_template::Shortfall::Quic.into());
-            }
             let ech_state = match &self.config.ech_mode {
                 Some(EchMode::Enable(ech_config)) if hello_template.inner().is_some() => {
                     Some(ech_config.state(self.server_name.clone(), &self.config)?)
