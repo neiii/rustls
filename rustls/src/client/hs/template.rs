@@ -41,7 +41,7 @@ use crate::msgs::enums::{ExtensionType, NamedGroup};
 use crate::msgs::fragmenter::{MAX_FRAGMENT_LEN, PACKET_OVERHEAD};
 use crate::msgs::handshake::{
     ClientExtensionsInput, HandshakeMessagePayload, HandshakePayload, HelloRetryRequest,
-    ServerExtensions, ServerHelloPayload, SessionId,
+    ServerExtensions, ServerHelloPayload, SessionId, TransportParameters,
 };
 use crate::msgs::message::{Message, MessagePayload};
 use crate::msgs::persist;
@@ -232,6 +232,10 @@ pub(super) fn emit_client_hello(
         }
         _ => None,
     };
+    // FAIM: a QUIC connection's own transport parameters go out in the template's
+    // extension 57, where its client sent its own, which carry the client's source
+    // connection id (faim-http#202).
+    fresh.quic_transport_parameters = quic_transport_parameters(&extra_exts)?;
 
     let sent_before = core::mem::take(&mut input.template_key_shares);
     let mut active = Vec::new();
@@ -788,6 +792,22 @@ struct InnerFresh {
     psk: Option<Psk>,
 }
 
+/// The transport parameters a QUIC connection sends in its hello, for a template to send
+/// in its client's place; `None` over TCP. QUIC drafts sent them in another extension,
+/// which a template from a QUIC v1 or v2 hello doesn't carry, so a draft connection
+/// can't send a template.
+fn quic_transport_parameters(
+    extra_exts: &ClientExtensionsInput<'static>,
+) -> Result<Option<Vec<u8>>, Error> {
+    match &extra_exts.transport_parameters {
+        Some(TransportParameters::Quic(parameters)) => Ok(Some(parameters.bytes().to_vec())),
+        Some(TransportParameters::QuicDraft(_)) => Err(Error::General(
+            "a hello template can't send a QUIC draft's transport parameters".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
 /// The outer hello `template` sends with `fresh`, its inner hello sealed inside under
 /// `ech` (RFC 9849 §6.1, faim-http#601), and the early key schedule of a session the
 /// inner hello resumes.
@@ -813,6 +833,17 @@ fn seal_inner(
     };
     let mut inner_fresh = Fresh::new(ech.inner_hello_random.0, Vec::new());
     inner_fresh.server_name = inner.server_name;
+    // An inner hello that sends its own transport parameters, rather than naming the
+    // outer hello's in `ech_outer_extensions`, sends this connection's too.
+    if inner_template
+        .extensions()
+        .iter()
+        .any(|extension| {
+            extension.kind() == faim_template::ExtensionType::QUIC_TRANSPORT_PARAMETERS
+        })
+    {
+        inner_fresh.quic_transport_parameters = fresh.quic_transport_parameters.clone();
+    }
     for slot in inner_template.key_share_slots() {
         let KeyShareSlot::Key { group, .. } = slot else {
             continue;
